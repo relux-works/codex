@@ -12,12 +12,15 @@ use codex_extension_api::CommandStartInput;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
+use codex_extension_api::ToolStartInput;
 use codex_features::Feature;
+use codex_guardian_context::PermissionContext;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_tools::ToolPayload;
 use codex_utils_path_uri::PathUri;
 use core_test_support::TestTargetOs;
 use core_test_support::hooks::trust_discovered_hooks;
@@ -48,9 +51,34 @@ struct RecordedCommand {
 #[derive(Default)]
 struct CommandRecorder {
     commands: Mutex<Vec<RecordedCommand>>,
+    exec_arguments: Mutex<Vec<String>>,
+    write_stdin_permissions: Mutex<Vec<Option<PermissionContext>>>,
 }
 
 impl ToolLifecycleContributor for CommandRecorder {
+    fn on_tool_start<'a>(&'a self, input: ToolStartInput<'a>) -> ToolLifecycleFuture<'a> {
+        Box::pin(async move {
+            match input.tool_name.name.as_str() {
+                "exec_command" => {
+                    if let ToolPayload::Function { arguments } = input.payload {
+                        self.exec_arguments
+                            .lock()
+                            .expect("exec arguments")
+                            .push(arguments.clone());
+                    }
+                }
+                "write_stdin" => {
+                    let permissions = input.permissions.await;
+                    self.write_stdin_permissions
+                        .lock()
+                        .expect("write_stdin permissions")
+                        .push(permissions);
+                }
+                _ => {}
+            }
+        })
+    }
+
     fn on_command_start<'a>(&'a self, input: CommandStartInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
             let fixture_path = input
@@ -176,7 +204,7 @@ async fn command_start_receives_rewritten_command_and_executor_workdir(
     let arguments = json!({
         "cmd": "echo original-command-must-not-run",
         "workdir": "command-workdir",
-        "yield_time_ms": 5_000,
+        "yield_time_ms": 5_000.0,
     });
     let call = mode.call(call_id, arguments);
     responses::mount_sse_once(
@@ -235,6 +263,108 @@ async fn command_start_receives_rewritten_command_and_executor_workdir(
         output["output"].to_string().contains(fixture),
         "execution must wait for the callback to prepare its selected filesystem"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_stdin_integral_decimal_session_id_keeps_lifecycle_and_hook_arguments_exact()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "tool lifecycle context requires a host-native executor"
+    );
+
+    let long_running_command = match test_target_os() {
+        TestTargetOs::Linux | TestTargetOs::MacOs => "sleep 30",
+        TestTargetOs::Windows => "Start-Sleep -Seconds 30",
+    };
+    let hook_output = json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": { "command": long_running_command },
+        }
+    });
+    let recorder = Arc::new(CommandRecorder::default());
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.tool_lifecycle_contributor(recorder.clone());
+    let builder = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .with_config(configure_command_test_permissions)
+        .with_pre_build_hook(move |home| {
+            super::write_pre_tool_hook(home, "^Bash$", &hook_output)
+                .expect("write command-rewriting hook");
+        })
+        .with_config(trust_discovered_hooks);
+    let harness = TestCodexHarness::with_auto_env_builder(builder).await?;
+    let (test, server) = (harness.test(), harness.server());
+    harness
+        .write_file("executor-fixture.txt", "permission-context-marker")
+        .await?;
+
+    responses::mount_sse_sequence(
+        server,
+        vec![
+            responses::sse(vec![
+                responses::ev_response_created("response-1"),
+                responses::ev_function_call(
+                    "exec-call",
+                    "exec_command",
+                    r#"{"cmd":"echo original","tty":true,"yield_time_ms":250,"max_output_tokens":9007199254740993.0}"#,
+                ),
+                responses::ev_completed("response-1"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("response-2"),
+                responses::ev_function_call(
+                    "stdin-decimal-call",
+                    "write_stdin",
+                    r#"{"session_id":1000.0,"chars":"","yield_time_ms":250}"#,
+                ),
+                responses::ev_completed("response-2"),
+            ]),
+            responses::sse(vec![
+                responses::ev_response_created("response-3"),
+                responses::ev_function_call(
+                    "stdin-integer-call",
+                    "write_stdin",
+                    r#"{"session_id":1000,"chars":"\u0003","yield_time_ms":250}"#,
+                ),
+                responses::ev_completed("response-3"),
+            ]),
+            responses::sse(vec![
+                responses::ev_assistant_message("message-1", "finished"),
+                responses::ev_completed("response-4"),
+            ]),
+        ],
+    )
+    .await;
+
+    start_command_turn(test).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let exec_arguments = recorder.exec_arguments.lock().expect("exec arguments");
+    assert_eq!(exec_arguments.len(), 1);
+    assert!(
+        exec_arguments[0].contains("\"max_output_tokens\":9007199254740993.0"),
+        "the hook rewrite must preserve the exact untouched numeric lexeme: {exec_arguments:?}"
+    );
+    let permissions = recorder
+        .write_stdin_permissions
+        .lock()
+        .expect("write_stdin permissions");
+    assert_eq!(permissions.len(), 2);
+    let decimal_context = permissions[0]
+        .as_ref()
+        .expect("integral-decimal session id resolves lifecycle permissions");
+    let integer_context = permissions[1]
+        .as_ref()
+        .expect("integer session id resolves lifecycle permissions");
+    assert_eq!(decimal_context, integer_context);
     Ok(())
 }
 

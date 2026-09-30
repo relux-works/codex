@@ -22,12 +22,19 @@ use super::post_unified_exec_tool_use_payload;
 #[derive(Debug, Deserialize)]
 struct WriteStdinArgs {
     // The model is trained on `session_id`.
+    #[serde(deserialize_with = "codex_tools::arguments::i32::deserialize")]
     session_id: i32,
     #[serde(default)]
     chars: String,
-    #[serde(default = "super::default_write_stdin_yield_time_ms")]
+    #[serde(
+        default = "super::default_write_stdin_yield_time_ms",
+        deserialize_with = "codex_tools::arguments::u64::deserialize"
+    )]
     yield_time_ms: u64,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_usize::deserialize"
+    )]
     max_output_tokens: Option<usize>,
 }
 

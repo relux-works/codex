@@ -495,7 +495,7 @@ fn one_shot_exec_command_spec(spec: ToolSpec) -> ToolSpec {
     properties.remove("yield_time_ms");
     properties.insert(
         "timeout_ms".to_string(),
-        JsonSchema::number(Some(
+        JsonSchema::integer(Some(
             "Maximum command runtime. Defaults to 10000 ms.".to_string(),
         )),
     );

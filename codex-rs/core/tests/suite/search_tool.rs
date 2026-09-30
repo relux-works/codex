@@ -1072,8 +1072,9 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
     let dynamic_call_id = "dyn-search-call-1";
     let tool_name = "automation_update";
     let tool_description = "Create, update, view, or delete recurring automations.";
-    let tool_args = json!({ "mode": "create" });
+    let tool_args = json!({ "mode": "create", "ratio": 1.0 });
     let tool_call_arguments = serde_json::to_string(&tool_args)?;
+    assert!(tool_call_arguments.contains("\"ratio\":1.0"));
     let mock = mount_sse_sequence(
         &server,
         vec![
@@ -1115,6 +1116,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         "type": "object",
         "properties": {
             "mode": { "type": "string" },
+            "ratio": { "type": "number" },
         },
         "required": ["mode"],
         "additionalProperties": false,
@@ -1173,6 +1175,12 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
     assert_eq!(request.namespace.as_deref(), Some("codex_app"));
     assert_eq!(request.tool, tool_name);
     assert_eq!(request.arguments, tool_args);
+    assert!(
+        request.arguments["ratio"]
+            .as_number()
+            .is_some_and(serde_json::Number::is_f64),
+        "dynamic tool arguments must preserve numeric 1.0 as a floating JSON number"
+    );
 
     test.codex
         .submit(Op::DynamicToolResponse {

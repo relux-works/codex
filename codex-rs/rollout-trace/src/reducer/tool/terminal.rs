@@ -10,6 +10,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use serde::Deserialize;
+use serde::de::Error as _;
 use serde_json::Value as JsonValue;
 
 use super::push_unique;
@@ -407,7 +408,8 @@ fn parse_dispatch_terminal_request(value: JsonValue) -> Result<ParsedTerminalReq
         .context("write_stdin dispatch payload omitted function arguments")?;
     let args: DispatchedWriteStdinArgs = serde_json::from_str(&arguments)
         .context("parse write_stdin dispatch function arguments")?;
-    let terminal_id = terminal_id_from_json(&args.session_id)
+    let terminal_id = (!args.session_id.is_empty())
+        .then_some(args.session_id)
         .context("write_stdin dispatch payload omitted session_id")?;
 
     Ok(ParsedTerminalRequest {
@@ -538,12 +540,21 @@ fn json_text_content(value: &JsonValue) -> Option<String> {
     }
 }
 
-fn terminal_id_from_json(value: &JsonValue) -> Option<String> {
-    match value {
-        JsonValue::String(value) if !value.is_empty() => Some(value.clone()),
-        JsonValue::Number(value) => Some(value.to_string()),
-        _ => None,
+fn deserialize_terminal_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <&serde_json::value::RawValue>::deserialize(deserializer)?;
+    let raw = raw.get().trim_start();
+    if raw.starts_with('"') {
+        return serde_json::from_str(raw).map_err(D::Error::custom);
     }
+
+    let mut number_deserializer = serde_json::Deserializer::from_str(raw);
+    let process_id = codex_tools::arguments::i32::deserialize(&mut number_deserializer)
+        .map_err(D::Error::custom)?;
+    number_deserializer.end().map_err(D::Error::custom)?;
+    Ok(process_id.to_string())
 }
 
 #[derive(Deserialize)]
@@ -578,10 +589,19 @@ struct DispatchedToolPayload {
 
 #[derive(Deserialize)]
 struct DispatchedWriteStdinArgs {
-    session_id: JsonValue,
+    #[serde(deserialize_with = "deserialize_terminal_id")]
+    session_id: String,
     #[serde(default)]
     chars: String,
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_u64::deserialize"
+    )]
     yield_time_ms: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_usize::deserialize"
+    )]
     max_output_tokens: Option<usize>,
 }
 

@@ -99,6 +99,67 @@ async fn installed_goal_tools_create_goal_and_fill_empty_preview() -> anyhow::Re
 }
 
 #[tokio::test]
+async fn create_goal_accepts_integral_decimal_budget_and_rejects_invalid_numbers()
+-> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let tools = installed_tools(runtime.clone(), thread_id).await;
+    let create_tool = tool_by_name(&tools, "create_goal");
+    let schema = serde_json::to_value(create_tool.spec())?;
+    assert_eq!(
+        schema["parameters"]["properties"]["token_budget"]["type"],
+        "integer"
+    );
+
+    for (call_id, arguments) in [
+        (
+            "fractional-budget",
+            json!({ "objective": "fractional goal", "token_budget": 0.5 }),
+        ),
+        (
+            "string-budget",
+            json!({ "objective": "string goal", "token_budget": "20000000" }),
+        ),
+        (
+            "boolean-budget",
+            json!({ "objective": "boolean goal", "token_budget": true }),
+        ),
+    ] {
+        let error = match create_tool
+            .handle(tool_call("create_goal", call_id, arguments))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("invalid token budget should be rejected: {call_id}"),
+        };
+        let FunctionCallError::RespondToModel(message) = error else {
+            panic!("expected structured argument error for {call_id}: {error:?}");
+        };
+        assert!(
+            message.contains("invalid value") || message.contains("invalid type"),
+            "expected integer argument error for {call_id}, got {message}"
+        );
+    }
+    assert_eq!(
+        runtime.thread_goals().get_thread_goal(thread_id).await?,
+        None
+    );
+
+    let invocation = tool_call(
+        "create_goal",
+        "integral-decimal-budget",
+        json!({ "objective": "large integer budget", "token_budget": 20_000_000.0 }),
+    );
+    let output = create_tool.handle(invocation.clone()).await?;
+    assert_eq!(
+        output.code_mode_result(&invocation.payload)["goal"]["tokenBudget"],
+        json!(20_000_000)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()> {
     let runtime = test_runtime().await?;
     let thread_id = test_thread_id()?;

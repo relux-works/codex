@@ -292,6 +292,10 @@ impl CoreToolRuntime for Handler {
 struct WaitArgs {
     #[serde(default)]
     targets: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_i64::deserialize"
+    )]
     timeout_ms: Option<i64>,
 }
 

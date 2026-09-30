@@ -606,3 +606,88 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         ]
     );
 }
+
+#[tokio::test]
+async fn exec_command_rejects_fractional_and_wrong_typed_integer_fields() {
+    for field in ["yield_time_ms", "timeout_ms", "max_output_tokens"] {
+        for value in [
+            "1.5",
+            if field == "yield_time_ms" {
+                "\"10000\""
+            } else {
+                "\"1000\""
+            },
+            "true",
+        ] {
+            let arguments = format!(r#"{{"cmd":"exit 0","{field}":{value}}}"#);
+            let invocation = invocation_for_payload(
+                "exec_command",
+                "invalid-integer-field",
+                ToolPayload::Function { arguments },
+            )
+            .await;
+            let error = match ExecCommandHandler::default().handle(invocation).await {
+                Err(error) => error,
+                Ok(_) => panic!("invalid integer argument should fail: {field}={value}"),
+            };
+            let FunctionCallError::RespondToModel(message) = error else {
+                panic!("expected structured argument error for {field}={value}: {error:?}");
+            };
+            assert!(
+                message.starts_with("failed to parse function arguments:"),
+                "expected parse envelope for {field}={value}, got {message}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn write_stdin_rejects_fractional_and_wrong_typed_integer_fields() {
+    for (field, value) in [
+        ("session_id", "1.5"),
+        ("session_id", "\"1000\""),
+        ("session_id", "true"),
+        ("yield_time_ms", "1.5"),
+        ("yield_time_ms", "\"5000\""),
+        ("yield_time_ms", "true"),
+        ("max_output_tokens", "1.5"),
+        ("max_output_tokens", "\"1000\""),
+        ("max_output_tokens", "true"),
+    ] {
+        let defaults = [
+            ("session_id", "1000"),
+            ("yield_time_ms", "5000"),
+            ("max_output_tokens", "1000"),
+        ];
+        let arguments = format!(
+            "{{{}}}",
+            defaults
+                .iter()
+                .map(|(name, default)| {
+                    format!(
+                        "\"{name}\":{}",
+                        if *name == field { value } else { *default }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let invocation = invocation_for_payload(
+            "write_stdin",
+            "invalid-integer-field",
+            ToolPayload::Function { arguments },
+        )
+        .await;
+        let error = match WriteStdinHandler.handle(invocation).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid integer argument should fail: {field}={value}"),
+        };
+        let FunctionCallError::RespondToModel(message) = error else {
+            panic!("expected structured argument error for {field}={value}: {error:?}");
+        };
+        assert!(
+            message.starts_with("failed to parse function arguments:"),
+            "expected parse envelope for {field}={value}, got {message}"
+        );
+    }
+}

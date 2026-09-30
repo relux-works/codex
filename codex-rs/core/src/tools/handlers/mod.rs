@@ -44,8 +44,9 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
-use serde_json::Map;
 use serde_json::Value;
+use serde_json::value::RawValue;
+use std::collections::BTreeMap;
 
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::function_tool::FunctionCallError;
@@ -116,33 +117,36 @@ fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError
         })
 }
 
-fn rewrite_function_arguments(
-    arguments: &str,
-    tool_name: &str,
-    rewrite: impl FnOnce(&mut Map<String, Value>),
-) -> Result<String, FunctionCallError> {
-    let mut arguments: Value = parse_arguments(arguments)?;
-    let Value::Object(arguments) = &mut arguments else {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "{tool_name} arguments must be an object"
-        )));
-    };
-    rewrite(arguments);
-    serde_json::to_string(&arguments).map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to serialize rewritten {tool_name} arguments: {err}"
-        ))
-    })
-}
-
 fn rewrite_function_string_argument(
     arguments: &str,
     tool_name: &str,
     field_name: &str,
     value: &str,
 ) -> Result<String, FunctionCallError> {
-    rewrite_function_arguments(arguments, tool_name, |arguments| {
-        arguments.insert(field_name.to_string(), Value::String(value.to_string()));
+    if !arguments.trim_start().starts_with('{') {
+        let _: Value = parse_arguments(arguments)?;
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{tool_name} arguments must be an object"
+        )));
+    }
+
+    let mut arguments: BTreeMap<String, Box<RawValue>> = parse_arguments(arguments)?;
+    let replacement = serde_json::to_string(value).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to serialize rewritten {tool_name} arguments: {err}"
+        ))
+    })?;
+    let replacement = RawValue::from_string(replacement).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to serialize rewritten {tool_name} arguments: {err}"
+        ))
+    })?;
+    arguments.insert(field_name.to_string(), replacement);
+
+    serde_json::to_string(&arguments).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to serialize rewritten {tool_name} arguments: {err}"
+        ))
     })
 }
 

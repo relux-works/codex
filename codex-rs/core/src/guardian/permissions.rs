@@ -7,6 +7,13 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::RequestPermissionsEnvironmentArgs;
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct WriteStdinPermissionArgs {
+    #[serde(deserialize_with = "codex_tools::arguments::i32::deserialize")]
+    session_id: i32,
+}
 
 pub(crate) async fn for_tool(
     invocation: &ToolInvocation,
@@ -20,17 +27,13 @@ pub(crate) async fn for_tool(
             codex_apply_patch::parse_patch(input)?.environment_id
         }
         ("write_stdin", ToolPayload::Function { arguments }) => {
-            let arguments: serde_json::Value = serde_json::from_str(arguments)?;
-            let process_id = arguments["session_id"]
-                .as_i64()
-                .and_then(|id| i32::try_from(id).ok())
-                .ok_or_else(|| anyhow::anyhow!("missing terminal session id"))?;
+            let arguments: WriteStdinPermissionArgs = serde_json::from_str(arguments)?;
             Some(
                 invocation
                     .session
                     .services
                     .unified_exec_manager
-                    .environment_id_for_process(process_id)
+                    .environment_id_for_process(arguments.session_id)
                     .await
                     .ok_or_else(|| anyhow::anyhow!("terminal session is unavailable"))?,
             )

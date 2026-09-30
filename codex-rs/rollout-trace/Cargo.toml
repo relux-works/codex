@@ -16,9 +16,10 @@ workspace = true
 anyhow = { workspace = true }
 codex-code-mode = { workspace = true }
 codex-protocol = { workspace = true }
+codex-tools = { workspace = true }
 http = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 

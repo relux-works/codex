@@ -33,11 +33,20 @@ pub(crate) struct ExecCommandArgs {
     login: Option<bool>,
     #[serde(default = "default_tty")]
     tty: bool,
-    #[serde(default = "default_exec_yield_time_ms")]
+    #[serde(
+        default = "default_exec_yield_time_ms",
+        deserialize_with = "codex_tools::arguments::u64::deserialize"
+    )]
     yield_time_ms: u64,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_u64::deserialize"
+    )]
     timeout_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_usize::deserialize"
+    )]
     max_output_tokens: Option<usize>,
     #[serde(default)]
     sandbox_permissions: Option<SandboxPermissions>,

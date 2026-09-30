@@ -458,6 +458,10 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
         .expect("wait_agent should use object params");
     assert!(!properties.contains_key("targets"));
     assert!(properties.contains_key("timeout_ms"));
+    assert_eq!(
+        properties["timeout_ms"].schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Integer))
+    );
     assert!(description.contains(
         "Does not return the content; returns either a summary of which agents have updates (if any)"
     ));
@@ -473,6 +477,20 @@ fn wait_agent_tool_v2_uses_timeout_only_summary_output() {
         json!(
             "Brief wait summary without the agent's final content, including any timeout adjustment."
         )
+    );
+}
+
+#[test]
+fn wait_agent_tool_v1_timeout_schema_is_integer() {
+    let parameters = wait_agent_tool_parameters_v1(WaitAgentTimeoutOptions::default());
+    let timeout_schema = parameters
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("timeout_ms"))
+        .expect("wait_agent v1 should expose timeout_ms");
+    assert_eq!(
+        timeout_schema.schema_type,
+        Some(JsonSchemaType::Single(JsonSchemaPrimitiveType::Integer))
     );
 }
 

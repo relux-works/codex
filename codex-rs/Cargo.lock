@@ -4439,6 +4439,7 @@ dependencies = [
  "anyhow",
  "codex-code-mode",
  "codex-protocol",
+ "codex-tools",
  "http 1.4.0",
  "pretty_assertions",
  "serde",

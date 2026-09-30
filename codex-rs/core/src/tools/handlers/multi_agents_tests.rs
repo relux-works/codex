@@ -2963,6 +2963,56 @@ async fn wait_agent_rejects_non_positive_timeout() {
 }
 
 #[tokio::test]
+async fn wait_agent_accepts_integral_decimal_timeout() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    set_agent_control(&mut session, manager.agent_control());
+    let missing_agent = ThreadId::new();
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "wait_agent",
+        function_payload(json!({
+            "targets": [missing_agent.to_string()],
+            "timeout_ms": 30_000.0
+        })),
+    );
+    let output = WaitAgentHandler::default()
+        .handle(invocation)
+        .await
+        .expect("integral decimal timeout should be accepted by wait_agent v1");
+    let (content, success) = expect_text_output(output);
+    let result: crate::tools::handlers::multi_agents::wait::WaitAgentResult =
+        serde_json::from_str(&content).expect("wait_agent result should be json");
+    assert_eq!(success, None);
+    assert!(!result.timed_out);
+}
+
+#[tokio::test]
+async fn wait_agent_rejects_fractional_and_wrong_typed_timeouts() {
+    for value in ["1.5", "\"30000\"", "true"] {
+        let (session, turn) = make_session_and_context().await;
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait_agent",
+            function_payload(serde_json::from_str(&format!("{{\"timeout_ms\":{value}}}")).unwrap()),
+        );
+        let error = match WaitAgentHandler::default().handle(invocation).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid v1 timeout should be rejected: {value}"),
+        };
+        let FunctionCallError::RespondToModel(message) = error else {
+            panic!("expected argument error for v1 timeout {value}: {error:?}");
+        };
+        assert!(
+            message.starts_with("failed to parse function arguments:"),
+            "expected parse envelope for timeout {value}, got {message}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn wait_agent_rejects_invalid_target() {
     let (session, turn) = make_session_and_context().await;
     let invocation = invocation(
@@ -3052,7 +3102,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
                     session,
                     turn,
                     "wait_agent",
-                    function_payload(json!({"timeout_ms": 10_000})),
+                    function_payload(json!({"timeout_ms": 30_000.0})),
                 ))
                 .await
         }
@@ -3088,6 +3138,36 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
         }
     );
     assert_eq!(success, None);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_wait_agent_rejects_fractional_and_wrong_typed_timeouts() {
+    for value in ["1.5", "\"30000\"", "true"] {
+        let (session, mut turn) = make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        set_turn_config(&mut turn, config);
+        let invocation = invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "wait_agent",
+            function_payload(serde_json::from_str(&format!("{{\"timeout_ms\":{value}}}")).unwrap()),
+        );
+        let error = match WaitAgentHandlerV2::default().handle(invocation).await {
+            Err(error) => error,
+            Ok(_) => panic!("invalid v2 timeout should be rejected: {value}"),
+        };
+        let FunctionCallError::RespondToModel(message) = error else {
+            panic!("expected argument error for v2 timeout {value}: {error:?}");
+        };
+        assert!(
+            message.starts_with("failed to parse function arguments:"),
+            "expected parse envelope for timeout {value}, got {message}"
+        );
+    }
 }
 
 #[tokio::test]

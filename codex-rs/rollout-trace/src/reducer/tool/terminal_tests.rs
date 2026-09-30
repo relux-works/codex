@@ -331,10 +331,10 @@ fn dispatch_write_stdin_payload_reduces_to_terminal_operation() -> anyhow::Resul
             "payload": {
                 "type": "function",
                 "arguments": json!({
-                    "session_id": 123,
+                    "session_id": 123.0,
                     "chars": "echo hi\n",
-                    "yield_time_ms": 250,
-                    "max_output_tokens": 2000
+                    "yield_time_ms": 250.0,
+                    "max_output_tokens": 2000.0
                 }).to_string()
             }
         }),
@@ -435,6 +435,38 @@ fn dispatch_write_stdin_payload_reduces_to_terminal_operation() -> anyhow::Resul
         },
     );
 
+    Ok(())
+}
+
+#[test]
+fn dispatch_write_stdin_integral_decimals_match_integer_arguments_and_refuse_fractions()
+-> anyhow::Result<()> {
+    let parse = |arguments: &str| {
+        super::parse_dispatch_terminal_request(json!({
+            "tool_name": "write_stdin",
+            "payload": {
+                "type": "function",
+                "arguments": arguments
+            }
+        }))
+    };
+    let integer = parse(
+        r#"{"session_id":123,"chars":"echo hi\n","yield_time_ms":250,"max_output_tokens":2000}"#,
+    )?;
+    let decimal = parse(
+        r#"{"session_id":123.0,"chars":"echo hi\n","yield_time_ms":250.0,"max_output_tokens":2000.0}"#,
+    )?;
+    assert_eq!(decimal.terminal_id, integer.terminal_id);
+    assert_eq!(decimal.request, integer.request);
+
+    let error = match parse(r#"{"session_id":123.5,"chars":"","yield_time_ms":250}"#) {
+        Ok(_) => panic!("fractional session id must remain invalid"),
+        Err(error) => error,
+    };
+    assert!(
+        format!("{error:#}").contains("a fractional number"),
+        "fractional write_stdin arguments should be rejected by the exact integer parser: {error:#}"
+    );
     Ok(())
 }
 

@@ -126,6 +126,10 @@ impl CoreToolRuntime for Handler {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WaitArgs {
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_i64::deserialize"
+    )]
     timeout_ms: Option<i64>,
 }
 

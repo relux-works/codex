@@ -3885,6 +3885,78 @@ text(output.output);
     Ok(())
 }
 
+#[cfg_attr(windows, ignore = "no exec_command on Windows")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn code_mode_only_nested_exec_applies_integer_argument_validation() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_custom_tool_call(
+                "call-1",
+                "exec",
+                r#"
+const output = await tools.exec_command({
+  cmd: "printf code_mode_integer_adapter_marker",
+  yield_time_ms: 10000.0,
+  max_output_tokens: 10000.0,
+});
+let fractionalError;
+try {
+  await tools.exec_command({ cmd: "printf MUST_NOT_RUN", yield_time_ms: 1.5 });
+  fractionalError = "accepted";
+} catch (error) {
+  fractionalError = String(error?.message ?? error);
+}
+text(JSON.stringify({ output: output.output, fractionalError }));
+"#,
+            ),
+            ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+    let follow_up_mock = responses::mount_sse_once(
+        &server,
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-2"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        let _ = config.features.enable(Feature::CodeModeOnly);
+    });
+    let test = builder.build(&server).await?;
+    test.submit_turn("exercise nested integer argument validation")
+        .await?;
+
+    let request = follow_up_mock.single_request();
+    let (output, success) = custom_tool_output_body_and_success(&request, "call-1");
+    assert_ne!(
+        success,
+        Some(false),
+        "nested code-mode call failed unexpectedly: {output}"
+    );
+    let result: Value = serde_json::from_str(&output)?;
+    assert_eq!(result["output"], "code_mode_integer_adapter_marker");
+    let fractional_error = result["fractionalError"]
+        .as_str()
+        .expect("fractional nested exec should return a parse error");
+    assert!(
+        fractional_error.starts_with("failed to parse function arguments:"),
+        "fractional nested exec should preserve the argument-error envelope: {fractional_error}"
+    );
+    assert!(
+        fractional_error.contains("a fractional number"),
+        "fractional nested exec should identify the rejected value: {fractional_error}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_mode_does_not_expose_update_plan_by_default() -> Result<()> {
     skip_if_no_network!(Ok(()));

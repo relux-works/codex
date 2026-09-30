@@ -32,13 +32,14 @@ pub struct SleepHandler;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SleepArgs {
+    #[serde(deserialize_with = "codex_tools::arguments::u64::deserialize")]
     duration_ms: u64,
 }
 
 fn create_sleep_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "duration_ms".to_string(),
-        JsonSchema::number(Some(format!(
+        JsonSchema::integer(Some(format!(
             "How long to sleep in milliseconds. Must be between 1 and {MAX_SLEEP_DURATION_MS}."
         ))),
     )]);

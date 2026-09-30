@@ -51,6 +51,10 @@ enum GoalToolKind {
 #[serde(rename_all = "snake_case")]
 pub struct CreateGoalRequest {
     pub objective: String,
+    #[serde(
+        default,
+        deserialize_with = "codex_tools::arguments::option_i64::deserialize"
+    )]
     pub token_budget: Option<i64>,
 }
 

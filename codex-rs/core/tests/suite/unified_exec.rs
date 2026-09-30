@@ -1980,8 +1980,8 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
     let call_id = "uexec-clamped-max-output";
     let args = serde_json::json!({
         "cmd": "line_number=1; while [ \"$line_number\" -le 999 ]; do printf 'EXEC-LINE-%04d xxxxxxxxxxxxxxxxxxxx\\n' \"$line_number\"; line_number=$((line_number + 1)); done",
-        "yield_time_ms": 3_000,
-        "max_output_tokens": 70_000,
+        "yield_time_ms": 10_000.0,
+        "max_output_tokens": 70_000.0,
     });
 
     let responses = vec![
@@ -2023,6 +2023,97 @@ async fn exec_command_clamps_model_requested_max_output_tokens_to_policy() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_shot_exec_command_accepts_integral_decimal_timeout_and_rejects_fractional()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_cloud_config_bundle(
+            CloudConfigBundleFixture::loader_with_enterprise_requirement(
+                "[features]\nunified_exec = false\nshell_tool = true\n",
+            ),
+        )
+        .build_with_auto_env(&server)
+        .await?;
+
+    let accepted_call_id = "one-shot-timeout-accepted";
+    let fractional_call_id = "one-shot-timeout-fractional";
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-1"),
+                ev_function_call(
+                    accepted_call_id,
+                    "exec_command",
+                    r#"{"cmd":"echo ONE_SHOT_TIMEOUT_ACCEPTED","timeout_ms":10000.0}"#,
+                ),
+                ev_completed("resp-1"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-2"),
+                ev_function_call(
+                    fractional_call_id,
+                    "exec_command",
+                    r#"{"cmd":"echo MUST_NOT_RUN","timeout_ms":1.5}"#,
+                ),
+                ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-3"),
+            ]),
+        ],
+    )
+    .await;
+
+    submit_unified_exec_turn(&test, "run one-shot commands", PermissionProfile::Disabled).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = request_log.requests();
+    let initial_body = requests[0].body_json();
+    let exec_tool = initial_body["tools"]
+        .as_array()
+        .expect("model request should include tools")
+        .iter()
+        .find(|tool| tool["name"] == "exec_command")
+        .expect("one-shot exec_command should be exposed");
+    assert_eq!(
+        exec_tool["parameters"]["properties"]["timeout_ms"]["type"],
+        "integer"
+    );
+    assert!(
+        exec_tool["parameters"]["properties"]
+            .get("yield_time_ms")
+            .is_none(),
+        "one-shot exec_command should not advertise an interactive yield"
+    );
+
+    let accepted_output = requests[1]
+        .function_call_output_text(accepted_call_id)
+        .expect("accepted one-shot execution should return tool output");
+    assert!(accepted_output.contains("ONE_SHOT_TIMEOUT_ACCEPTED"));
+    let fractional_error = requests[2]
+        .function_call_output_text(fractional_call_id)
+        .expect("fractional one-shot timeout should return tool argument error");
+    assert!(
+        fractional_error.starts_with("failed to parse function arguments:"),
+        "{fractional_error}"
+    );
+    assert!(
+        fractional_error.contains("a fractional number"),
+        "{fractional_error}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Result<()> {
     // TODO(anp): Remove after unified-exec interactive fixtures support Windows/ConPTY.
     skip_if_target_windows!(Ok(()), "uses POSIX read/while and Unix TTY semantics");
@@ -2046,9 +2137,9 @@ async fn write_stdin_clamps_model_requested_max_output_tokens_to_policy() -> Res
     let stdin_call_id = "uexec-stdin-clamped-max-output";
     let stdin_args = serde_json::json!({
         "chars": "go\n",
-        "session_id": 1000,
-        "yield_time_ms": 3_000,
-        "max_output_tokens": 70_000,
+        "session_id": 1_000.0,
+        "yield_time_ms": 5_000.0,
+        "max_output_tokens": 70_000.0,
     });
 
     let responses = vec![
@@ -3055,8 +3146,9 @@ async fn unified_exec_reuses_session_via_stdin() -> Result<()> {
     let second_call_id = "uexec-stdin";
     let second_args = serde_json::json!({
         "chars": "hello unified exec\n",
-        "session_id": 1000,
-        "yield_time_ms": 500,
+        "session_id": 1_000.0,
+        "yield_time_ms": 5_000.0,
+        "max_output_tokens": 10_000.0,
     });
 
     let responses = vec![

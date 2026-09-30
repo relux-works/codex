@@ -869,7 +869,10 @@ async fn sleep_tool_uses_configured_time_provider() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     const CALL_ID: &str = "sleep";
-    const DURATION_MS: u64 = 12 * 60 * 60 * 1000;
+    const FRACTIONAL_CALL_ID: &str = "fractional-sleep";
+    const STRING_CALL_ID: &str = "string-sleep-duration";
+    const BOOLEAN_CALL_ID: &str = "boolean-sleep-duration";
+    const DURATION_MS: u64 = 1_000;
 
     let server = start_mock_server().await;
     let responses = mount_sse_sequence(
@@ -881,14 +884,44 @@ async fn sleep_tool_uses_configured_time_provider() -> Result<()> {
                     CALL_ID,
                     "clock",
                     "sleep",
-                    &json!({ "duration_ms": DURATION_MS }).to_string(),
+                    &json!({ "duration_ms": 1000.0 }).to_string(),
                 ),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
                 ev_response_created("resp-2"),
-                ev_assistant_message("msg-2", "done"),
+                ev_function_call_with_namespace(
+                    FRACTIONAL_CALL_ID,
+                    "clock",
+                    "sleep",
+                    r#"{"duration_ms":1.5}"#,
+                ),
                 ev_completed("resp-2"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_function_call_with_namespace(
+                    STRING_CALL_ID,
+                    "clock",
+                    "sleep",
+                    r#"{"duration_ms":"1000"}"#,
+                ),
+                ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                ev_function_call_with_namespace(
+                    BOOLEAN_CALL_ID,
+                    "clock",
+                    "sleep",
+                    r#"{"duration_ms":true}"#,
+                ),
+                ev_completed("resp-4"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-5"),
+                ev_assistant_message("msg-5", "done"),
+                ev_completed("resp-5"),
             ]),
         ],
     )
@@ -918,11 +951,47 @@ async fn sleep_tool_uses_configured_time_provider() -> Result<()> {
         DURATION_MS / 1_000
     );
     let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 5);
+    let sleep_tool = requests[0]
+        .tool_by_name("clock", "sleep")
+        .expect("sleep tool should be exposed");
+    assert_eq!(
+        sleep_tool["parameters"]["properties"]["duration_ms"]["type"],
+        "integer"
+    );
     assert!(
         requests[1]
             .function_call_output_text(CALL_ID)
             .is_some_and(|output| output.ends_with("Sleep completed."))
+    );
+    let fractional_error = requests[2]
+        .function_call_output_text(FRACTIONAL_CALL_ID)
+        .expect("fractional sleep should return a tool argument error");
+    assert!(
+        fractional_error.starts_with("failed to parse function arguments:"),
+        "{fractional_error}"
+    );
+    assert!(
+        fractional_error.contains("a fractional number"),
+        "{fractional_error}"
+    );
+    for (request, call_id) in [
+        (&requests[3], STRING_CALL_ID),
+        (&requests[4], BOOLEAN_CALL_ID),
+    ] {
+        let error = request
+            .function_call_output_text(call_id)
+            .expect("wrong-typed sleep duration should return a tool argument error");
+        assert!(
+            error.starts_with("failed to parse function arguments:"),
+            "{error}"
+        );
+        assert!(error.contains("invalid type"), "{error}");
+    }
+    assert_eq!(
+        time_provider.sleep_seconds.load(Ordering::Relaxed),
+        DURATION_MS / 1_000,
+        "invalid inputs must not reach the time provider"
     );
 
     Ok(())
