@@ -494,6 +494,17 @@ impl GoalRuntimeHandle {
 
     pub async fn restore_after_resume(&self) -> Result<(), String> {
         let permit = self.goal_state_permit().await?;
+        if self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .get_thread_goal(self.thread_id())
+            .await
+            .map_err(|err| err.to_string())?
+            .is_some_and(|goal| goal.status == codex_state::ThreadGoalStatus::BudgetLimited)
+        {
+            return Ok(());
+        }
         let goal = self.reconcile_live_activity(&permit).await?;
         if !self.is_enabled() {
             return Ok(());
