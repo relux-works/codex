@@ -342,7 +342,6 @@ where
                     )
                     .await
             {
-                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 input.thread_store.remove::<TurnStartOptions>();
                 tracing::warn!(
                     "failed to stop active goal after repeated execution failures for {turn_id}: {err}"
@@ -353,7 +352,6 @@ where
                 .stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::EmptyResponse)
                 .await
             {
-                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 input.thread_store.remove::<TurnStartOptions>();
                 tracing::warn!("failed to stop goal after empty responses for {turn_id}: {err}");
                 return;
@@ -367,7 +365,6 @@ where
                 )
                 .await
             {
-                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 input.thread_store.remove::<TurnStartOptions>();
                 tracing::warn!(
                     "failed to account active goal progress at turn stop for {turn_id}: {err}"
