@@ -413,7 +413,6 @@ where
                 )
                 .await
             {
-                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 tracing::warn!(
                     "failed to account active goal progress after turn abort for {turn_id}: {err}"
                 );
