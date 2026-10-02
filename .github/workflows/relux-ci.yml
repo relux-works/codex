@@ -1,0 +1,161 @@
+# relux-works/codex fork CI (not part of the upstream patch series).
+# Heavy validation lanes for the goal-burn stories run on GitHub-hosted runners only:
+# the fork is public, so self-hosted runners must never execute its workflows.
+# Evidence runs: the orchestrator pushes the exact Change Request tree or landing commit to a
+# `ci/**` branch, then dispatches this workflow with that commit's SHA; jobs check out exactly it.
+# Push runs on `ci/relux-ci-selftest/**` only test changes to this workflow itself.
+name: relux-ci
+run-name: relux-ci ${{ inputs.label || github.ref_name }} @ ${{ inputs.sha || github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Exact commit to validate (must be reachable from a pushed ref)
+        required: true
+      label:
+        description: Free-form label, e.g. TASK-ID/revN
+        required: false
+  push:
+    branches: ["ci/relux-ci-selftest/**"]
+
+permissions:
+  contents: read
+
+# One group per exact commit (dispatch and push alike), so distinct SHAs never cancel each other.
+concurrency:
+  group: relux-ci-${{ inputs.sha || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUSTC_WRAPPER: sccache
+  # sccache keeps a local disk cache per lane, persisted with actions/cache (the GitHub Actions cache backend
+  # rejected every write here). Keep the server alive for the whole job so the final stats cover every build.
+  SCCACHE_CACHE_SIZE: 4G
+  SCCACHE_IDLE_TIMEOUT: "0"
+  INSTA_UPDATE: "no"
+  NEXTEST_RETRIES: "2"
+
+jobs:
+  lanes:
+    name: ${{ matrix.lane }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [lint, small, core, app-server]
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      # Evidence exactness: the dispatch input must be a full commit id, and the job must test exactly it.
+      - name: Verify the checked-out commit
+        env:
+          WANT_SHA: ${{ inputs.sha || github.sha }}
+        run: |
+          [[ "$WANT_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::sha must be a full 40-hex commit id, got '$WANT_SHA'"; exit 1; }
+          HEAD_SHA="$(git rev-parse HEAD)"
+          [ "$HEAD_SHA" = "$WANT_SHA" ] || { echo "::error::checked out $HEAD_SHA, expected $WANT_SHA"; exit 1; }
+
+      - name: Free runner disk
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Linux build dependencies
+        working-directory: .
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libasound2-dev bubblewrap
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy, rustfmt
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest,sccache
+
+      - name: Configure sccache disk cache
+        run: echo "SCCACHE_DIR=${CI_BUILD_ROOT}/sccache" >> "$GITHUB_ENV"
+
+      - name: Restore sccache cache
+        uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-relux-${{ matrix.lane }}-${{ hashFiles('codex-rs/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            sccache-relux-${{ matrix.lane }}-${{ hashFiles('codex-rs/Cargo.lock') }}-
+            sccache-relux-${{ matrix.lane }}-
+
+      - uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
+
+      # `just fmt-check` also runs the Python SDK and scripts formatters through uv.
+      - name: Install uv
+        if: matrix.lane == 'lint'
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.3"
+
+      - name: Lint (fmt + clippy)
+        if: matrix.lane == 'lint'
+        run: |
+          just fmt-check
+          just clippy -p codex-tools -p codex-core -p codex-goal-extension -p codex-extension-api -p codex-app-server -p codex-rollout-trace -- -D warnings
+
+      - name: Small crates tests
+        if: matrix.lane == 'small'
+        run: INSTA_WORKSPACE_ROOT="$PWD" just test -p codex-tools -p codex-goal-extension -p codex-extension-api -p codex-rollout-trace
+
+      - name: Helper binaries for integration tests
+        if: matrix.lane == 'core' || matrix.lane == 'app-server'
+        run: >
+          cargo build
+          -p codex-rmcp-client --bin test_stdio_server --bin test_streamable_http_server
+          -p codex-shell-escalation --bin codex-execve-wrapper
+          -p codex-app-server --bin codex-app-server --bin codex-app-server-test-notify-capture --bin exec-server
+          -p codex-code-mode-host --bin codex-code-mode-host
+          -p codex-cli --bin codex -p codex-exec --bin codex-exec
+          -p codex-linux-sandbox --bin codex-linux-sandbox
+
+      # Hosted-runner quarantine (environment, not product code): on ubuntu-24.04 runners these zsh-fork
+      # tests fail before running, because the fs sandbox helper refuses to build its bubblewrap command
+      # ("unreadable glob" under the test's temp dir). Deterministic 3/3 on relux/main in runs 36959471910
+      # and 36959934198; the same tests are quarantined on the local gate for a host zsh difference.
+      - name: codex-core tests
+        if: matrix.lane == 'core'
+        run: >
+          INSTA_WORKSPACE_ROOT="$PWD" just test -p codex-core -E 'not (
+          test(=suite::skill_approval::shell_zsh_fork_skill_scripts_ignore_declared_permissions) |
+          test(=suite::unified_exec_zsh_fork_approvals::unified_exec_zsh_fork_guardian_reviews_persistent_terminal_in_current_turn) |
+          test(=suite::unified_exec_zsh_fork_approvals::unified_exec_zsh_fork_parent_approval_preserves_denied_reads))'
+
+      - name: codex-app-server tests
+        if: matrix.lane == 'app-server'
+        run: INSTA_WORKSPACE_ROOT="$PWD" just test -p codex-app-server
+
+      - name: Save sccache cache
+        if: always() && !cancelled()
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ env.SCCACHE_DIR }}
+          key: sccache-relux-${{ matrix.lane }}-${{ hashFiles('codex-rs/Cargo.lock') }}-${{ github.run_id }}
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
