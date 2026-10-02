@@ -336,11 +336,7 @@ impl UnifiedExecProcessManager {
         ) else {
             return;
         };
-        let Ok(_) = self.receipt_store.acknowledge_sampled(&lease) else {
-            return;
-        };
-        let sampled_seq = hooks.next_sample_seq();
-        hooks.retention.move_to_sampled(receipt_id, sampled_seq);
+        let _ = lease;
     }
 
     pub(crate) async fn receipt_for_process(
