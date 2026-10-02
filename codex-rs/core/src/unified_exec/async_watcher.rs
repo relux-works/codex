@@ -198,7 +198,7 @@ pub(crate) fn spawn_exit_watcher(
         if let Some(hook) = receipt_hook.as_ref() {
             let completion = match failure_message.as_ref() {
                 Some(_) => TerminalCompletion {
-                    exit_code: None,
+                    exit_code: Some(-1),
                     timed_out: process.timed_out(),
                 },
                 None => TerminalCompletion {
