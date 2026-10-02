@@ -187,7 +187,7 @@ fn enforce_retention_cap(bytes: Vec<u8>, omitted_bytes: usize) -> (Vec<u8>, usiz
     let mut capped = Vec::with_capacity(UNIFIED_EXEC_OUTPUT_MAX_BYTES);
     capped.extend_from_slice(&bytes[..head_budget]);
     capped.extend_from_slice(&bytes[bytes.len().saturating_sub(tail_budget)..]);
-    let omitted_bytes = omitted_bytes.saturating_add(bytes.len() - UNIFIED_EXEC_OUTPUT_MAX_BYTES);
+    let omitted_bytes = omitted_bytes.saturating_sub(bytes.len() - UNIFIED_EXEC_OUTPUT_MAX_BYTES);
     (capped, omitted_bytes)
 }
 
