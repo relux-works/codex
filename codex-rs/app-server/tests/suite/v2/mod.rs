@@ -56,6 +56,8 @@ mod fs;
 #[path = "gateway_oauth_tests.rs"]
 mod gateway_oauth;
 mod git_attribution;
+#[path = "goal_activity_tests.rs"]
+mod goal_activity;
 mod guardian_v2;
 mod history_notes_extension;
 mod hooks_list;

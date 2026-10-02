@@ -1721,7 +1721,7 @@ fn tool_names(tools: &[Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>]) -> Ve
 }
 
 struct GoalExtensionHarness {
-    registry: Arc<codex_extension_api::ExtensionRegistry<()>>,
+    registry: Arc<codex_extension_api::ExtensionRegistry<bool>>,
     session_store: ExtensionData,
     thread_store: ExtensionData,
     goal_service: Arc<GoalService>,
@@ -1734,7 +1734,7 @@ impl GoalExtensionHarness {
         thread_id: ThreadId,
     ) -> anyhow::Result<Self> {
         let sink = Arc::new(RecordingEventSink::default());
-        let mut builder = ExtensionRegistryBuilder::<()>::with_event_sink(sink.clone());
+        let mut builder = ExtensionRegistryBuilder::<bool>::with_event_sink(sink.clone());
         let goal_service = Arc::new(GoalService::new());
         install_with_backend(
             &mut builder,
@@ -1743,8 +1743,8 @@ impl GoalExtensionHarness {
             /*metrics_client*/ None,
             Weak::new(),
             Arc::clone(&goal_service),
-            |_| GoalExtensionConfig {
-                enabled: true,
+            |enabled| GoalExtensionConfig {
+                enabled: *enabled,
                 max_goal_token_budget: None,
             },
         );
@@ -1755,7 +1755,7 @@ impl GoalExtensionHarness {
         for contributor in registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
-                    config: &(),
+                    config: &true,
                     session_source: &session_source,
                     persistent_thread_state_available: true,
                     environments: &[],
@@ -1798,7 +1798,7 @@ impl GoalExtensionHarness {
         for contributor in self.registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
-                    config: &(),
+                    config: &true,
                     session_source: &session_source,
                     persistent_thread_state_available: true,
                     environments: &[],
@@ -2123,3 +2123,6 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
 }
+
+#[path = "goal_extension_backend/goal_activity_tests.rs"]
+mod goal_activity;
