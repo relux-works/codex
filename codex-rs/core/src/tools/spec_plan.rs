@@ -1248,7 +1248,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
                         .config
                         .current_time_reminder
                         .as_ref()
-                        .is_some_and(|config| config.sleep_tool)
+                        .is_some_and(|config| config.sleep_tool || context.goal_activity_present)
                 } else {
                     model_has_clock || context.goal_activity_present
                 }
