@@ -118,12 +118,12 @@ impl GoalService {
         let Some(runtime) = self.runtime_for_thread(thread_id) else {
             return Ok(());
         };
-        let _goal_state_permit = runtime
+        let goal_state_permit = runtime
             .goal_state_permit()
             .await
             .map_err(GoalServiceError::Internal)?;
         runtime
-            .prepare_external_goal_mutation()
+            .prepare_external_goal_mutation_locked(&goal_state_permit)
             .await
             .map_err(GoalServiceError::Internal)
     }
@@ -176,7 +176,7 @@ impl GoalService {
         let runtime = self.runtime_for_thread(thread_id);
         // Hold this through the prepare/write window so idle continuation cannot
         // launch from goal state that this external mutation is about to change.
-        let _goal_state_permit = match runtime.as_ref() {
+        let goal_state_permit = match runtime.as_ref() {
             Some(runtime) => Some(
                 runtime
                     .goal_state_permit()
@@ -186,7 +186,8 @@ impl GoalService {
             None => None,
         };
         if let Some(runtime) = runtime.as_ref()
-            && let Err(err) = runtime.prepare_external_goal_mutation().await
+            && let Some(permit) = goal_state_permit.as_ref()
+            && let Err(err) = runtime.prepare_external_goal_mutation_locked(permit).await
         {
             tracing::warn!("failed to prepare external goal mutation: {err}");
         }
@@ -275,7 +276,13 @@ impl GoalService {
                 .map(|goal| (goal, Some(previous_goal)))?
         };
 
-        if let Some(runtime) = runtime.as_ref() {
+        if let Some(runtime) = runtime.as_ref()
+            && let Some(permit) = goal_state_permit.as_ref()
+        {
+            runtime
+                .reconcile_live_activity(permit)
+                .await
+                .map_err(GoalServiceError::Internal)?;
             runtime.clear_pending_turn_start_options().await;
         }
 
@@ -307,7 +314,8 @@ impl GoalService {
             None => None,
         };
         if let Some(runtime) = runtime.as_ref()
-            && let Err(err) = runtime.prepare_external_goal_mutation().await
+            && let Some(permit) = goal_state_permit.as_ref()
+            && let Err(err) = runtime.prepare_external_goal_mutation_locked(permit).await
         {
             tracing::warn!("failed to prepare external goal mutation: {err}");
         }
@@ -319,6 +327,12 @@ impl GoalService {
             .map_err(|err| {
                 GoalServiceError::Internal(format!("failed to clear thread goal: {err}"))
             })?;
+        if let Some(runtime) = runtime.as_ref()
+            && let Some(permit) = goal_state_permit.as_ref()
+        {
+            // A committed clear revokes capability even while Goals is disabled.
+            runtime.clear_activity(permit).await;
+        }
         let cleared = cleared_goal.is_some();
         if cleared && let Some(runtime) = runtime.as_ref() {
             runtime.clear_pending_turn_start_options().await;
