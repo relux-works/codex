@@ -1,0 +1,535 @@
+//! In-memory receipt state for opted-in background exec completions.
+//!
+//! This module owns only the receipt lifecycle. Exec launch, watcher, mailbox,
+//! and sampling-request integration are separate stages.
+//
+// The exported API is intentionally unused until those later integration stages.
+#![allow(dead_code)]
+
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+
+use codex_protocol::ThreadId;
+use thiserror::Error;
+use uuid::Uuid;
+
+pub(crate) const MAX_COMPLETION_RECEIPTS: usize = 64;
+const MAX_TERMINAL_RECEIPTS: usize = 64;
+const MAX_RECEIPT_ID_ATTEMPTS: usize = 4;
+const MAX_CALL_ID_BYTES: usize = 256;
+
+/// Identifies the thread runtime and tool call that owns a receipt.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ReceiptOwner {
+    thread_id: ThreadId,
+    runtime_generation: u64,
+    call_id: Box<str>,
+}
+
+impl ReceiptOwner {
+    pub(crate) fn new(
+        thread_id: ThreadId,
+        runtime_generation: u64,
+        call_id: impl Into<String>,
+    ) -> Result<Self, ReceiptError> {
+        let call_id = call_id.into();
+        if call_id.is_empty() || call_id.len() > MAX_CALL_ID_BYTES {
+            return Err(ReceiptError::InvalidOwner);
+        }
+
+        Ok(Self {
+            thread_id,
+            runtime_generation,
+            call_id: call_id.into_boxed_str(),
+        })
+    }
+}
+
+impl Debug for ReceiptOwner {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceiptOwner(<opaque>)")
+    }
+}
+
+/// Opaque identifier for one reserved completion slot.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ReceiptId(Uuid);
+
+impl Debug for ReceiptId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceiptId(<opaque>)")
+    }
+}
+
+/// The finalized process outcome retained by the receipt state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalCompletion {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) timed_out: bool,
+}
+
+/// The initial tool response either returns a terminal result or arms a wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitialResponseDecision {
+    InlineResult,
+    Arm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InitialResponseOutcome {
+    InlineResult(TerminalCompletion),
+    Armed,
+    Queued,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExitPublicationOutcome {
+    RetainedUntilDecision,
+    Queued,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SamplingSource {
+    PushedCompletion,
+    TerminalStdinOutput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CancellationReason {
+    Released,
+    OwnerStopped,
+    Shutdown,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReceiptStatus {
+    Reserved,
+    Armed,
+    Queued,
+    LeasedToSampling { source: SamplingSource },
+    InlineResult,
+    Sampled { source: SamplingSource },
+    Cancelled { reason: CancellationReason },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum ReceiptError {
+    #[error("receipt capacity is full (limit {capacity})")]
+    CapacityExceeded { capacity: usize },
+    #[error("receipt owner must have a non-empty call id no longer than 256 bytes")]
+    InvalidOwner,
+    #[error("receipt id is unknown or has expired from the bounded terminal history")]
+    UnknownReceipt,
+    #[error("receipt belongs to a different thread, runtime generation, or call")]
+    ForeignOwner,
+    #[error("receipt is already leased to a sampling path")]
+    AlreadyLeased,
+    #[error("receipt claim was already consumed")]
+    AlreadyConsumed,
+    #[error("receipt was cancelled: {reason:?}")]
+    Cancelled { reason: CancellationReason },
+    #[error("receipt is not valid for this operation in state {actual:?}")]
+    InvalidTransition { actual: ReceiptStatus },
+    #[error("sampling lease is stale or no longer owns this receipt")]
+    StaleLease,
+    #[error("receipt is already terminal")]
+    AlreadyTerminal,
+    #[error("could not allocate a unique opaque receipt id")]
+    IdGenerationFailed,
+    #[error("completion receipt lock was poisoned by a panic")]
+    LockPoisoned,
+}
+
+/// A sampling claim. Its fields are private so a caller cannot mint a lease.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SamplingLease {
+    receipt_id: ReceiptId,
+    owner: ReceiptOwner,
+    token: Uuid,
+    source: SamplingSource,
+}
+
+impl Debug for SamplingLease {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SamplingLease(<opaque>)")
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct CompletionReceiptStore {
+    state: Mutex<StoreState>,
+}
+
+#[derive(Default)]
+struct StoreState {
+    active: HashMap<ReceiptId, ReceiptRecord>,
+    terminal: VecDeque<TerminalReceipt>,
+}
+
+struct ReceiptRecord {
+    owner: ReceiptOwner,
+    phase: ReceiptPhase,
+}
+
+enum ReceiptPhase {
+    Reserved {
+        completion: Option<TerminalCompletion>,
+    },
+    Armed,
+    Queued(TerminalCompletion),
+    LeasedToSampling {
+        completion: TerminalCompletion,
+        token: Uuid,
+        source: SamplingSource,
+    },
+    InlineResult,
+    Sampled {
+        source: SamplingSource,
+    },
+    Cancelled(CancellationReason),
+}
+
+impl ReceiptPhase {
+    fn status(&self) -> ReceiptStatus {
+        match self {
+            Self::Reserved { .. } => ReceiptStatus::Reserved,
+            Self::Armed => ReceiptStatus::Armed,
+            Self::Queued(_) => ReceiptStatus::Queued,
+            Self::LeasedToSampling { source, .. } => {
+                ReceiptStatus::LeasedToSampling { source: *source }
+            }
+            Self::InlineResult => ReceiptStatus::InlineResult,
+            Self::Sampled { source } => ReceiptStatus::Sampled { source: *source },
+            Self::Cancelled(reason) => ReceiptStatus::Cancelled { reason: *reason },
+        }
+    }
+
+    fn error(&self) -> ReceiptError {
+        match self {
+            Self::Reserved { .. }
+            | Self::Armed
+            | Self::Queued(_)
+            | Self::LeasedToSampling { .. } => ReceiptError::InvalidTransition {
+                actual: self.status(),
+            },
+            Self::InlineResult => ReceiptError::InvalidTransition {
+                actual: ReceiptStatus::InlineResult,
+            },
+            Self::Sampled { .. } => ReceiptError::AlreadyConsumed,
+            Self::Cancelled(reason) => ReceiptError::Cancelled { reason: *reason },
+        }
+    }
+}
+
+struct TerminalReceipt {
+    id: ReceiptId,
+    owner: ReceiptOwner,
+    phase: ReceiptPhase,
+}
+
+impl StoreState {
+    fn terminal(&self, receipt_id: ReceiptId) -> Option<&TerminalReceipt> {
+        self.terminal
+            .iter()
+            .rev()
+            .find(|receipt| receipt.id == receipt_id)
+    }
+
+    fn terminal_error(&self, receipt_id: ReceiptId, owner: &ReceiptOwner) -> ReceiptError {
+        match self.terminal(receipt_id) {
+            Some(receipt) if receipt.owner != *owner => ReceiptError::ForeignOwner,
+            Some(receipt) => receipt.phase.error(),
+            None => ReceiptError::UnknownReceipt,
+        }
+    }
+
+    fn retire(&mut self, receipt_id: ReceiptId, phase: ReceiptPhase) -> Result<(), ReceiptError> {
+        let record = self
+            .active
+            .remove(&receipt_id)
+            .ok_or(ReceiptError::UnknownReceipt)?;
+        if self.terminal.len() == MAX_TERMINAL_RECEIPTS {
+            self.terminal.pop_front();
+        }
+        self.terminal.push_back(TerminalReceipt {
+            id: receipt_id,
+            owner: record.owner,
+            phase,
+        });
+        Ok(())
+    }
+}
+
+impl CompletionReceiptStore {
+    fn lock_state(&self) -> Result<MutexGuard<'_, StoreState>, ReceiptError> {
+        self.state.lock().map_err(|_| ReceiptError::LockPoisoned)
+    }
+
+    /// Reserves capacity before the caller launches an opted-in process.
+    pub(crate) fn reserve(&self, owner: ReceiptOwner) -> Result<ReceiptId, ReceiptError> {
+        let mut state = self.lock_state()?;
+        if state.active.len() >= MAX_COMPLETION_RECEIPTS {
+            return Err(ReceiptError::CapacityExceeded {
+                capacity: MAX_COMPLETION_RECEIPTS,
+            });
+        }
+
+        let mut receipt_id = None;
+        for _ in 0..MAX_RECEIPT_ID_ATTEMPTS {
+            let candidate = ReceiptId(Uuid::new_v4());
+            if !state.active.contains_key(&candidate) && state.terminal(candidate).is_none() {
+                receipt_id = Some(candidate);
+                break;
+            }
+        }
+        let receipt_id = receipt_id.ok_or(ReceiptError::IdGenerationFailed)?;
+        state.active.insert(
+            receipt_id,
+            ReceiptRecord {
+                owner,
+                phase: ReceiptPhase::Reserved { completion: None },
+            },
+        );
+        Ok(receipt_id)
+    }
+
+    /// Resolves whether the initial response is terminal or acknowledges a wake.
+    pub(crate) fn resolve_initial_response(
+        &self,
+        receipt_id: ReceiptId,
+        owner: &ReceiptOwner,
+        decision: InitialResponseDecision,
+    ) -> Result<InitialResponseOutcome, ReceiptError> {
+        enum Action {
+            Inline(TerminalCompletion),
+            Armed,
+            Queued(TerminalCompletion),
+        }
+
+        let mut state = self.lock_state()?;
+        let action = match state.active.get(&receipt_id) {
+            Some(record) if record.owner != *owner => return Err(ReceiptError::ForeignOwner),
+            Some(record) => match (&record.phase, decision) {
+                (
+                    ReceiptPhase::Reserved {
+                        completion: Some(completion),
+                    },
+                    InitialResponseDecision::InlineResult,
+                ) => Action::Inline(*completion),
+                (
+                    ReceiptPhase::Reserved { completion: None },
+                    InitialResponseDecision::InlineResult,
+                ) => {
+                    return Err(ReceiptError::InvalidTransition {
+                        actual: ReceiptStatus::Reserved,
+                    });
+                }
+                (
+                    ReceiptPhase::Reserved {
+                        completion: Some(completion),
+                    },
+                    InitialResponseDecision::Arm,
+                ) => Action::Queued(*completion),
+                (ReceiptPhase::Reserved { completion: None }, InitialResponseDecision::Arm) => {
+                    Action::Armed
+                }
+                (phase, _) => {
+                    return Err(ReceiptError::InvalidTransition {
+                        actual: phase.status(),
+                    });
+                }
+            },
+            None => return Err(state.terminal_error(receipt_id, owner)),
+        };
+
+        match action {
+            Action::Inline(completion) => {
+                state.retire(receipt_id, ReceiptPhase::InlineResult)?;
+                Ok(InitialResponseOutcome::InlineResult(completion))
+            }
+            Action::Armed => {
+                if let Some(record) = state.active.get_mut(&receipt_id) {
+                    record.phase = ReceiptPhase::Armed;
+                    Ok(InitialResponseOutcome::Armed)
+                } else {
+                    Err(ReceiptError::UnknownReceipt)
+                }
+            }
+            Action::Queued(completion) => {
+                if let Some(record) = state.active.get_mut(&receipt_id) {
+                    record.phase = ReceiptPhase::Queued(completion);
+                    Ok(InitialResponseOutcome::Queued)
+                } else {
+                    Err(ReceiptError::UnknownReceipt)
+                }
+            }
+        }
+    }
+
+    /// Publishes a fully finalized exit, retaining it if the response is undecided.
+    pub(crate) fn publish_exit(
+        &self,
+        receipt_id: ReceiptId,
+        owner: &ReceiptOwner,
+        completion: TerminalCompletion,
+    ) -> Result<ExitPublicationOutcome, ReceiptError> {
+        let mut state = self.lock_state()?;
+        let record = match state.active.get_mut(&receipt_id) {
+            Some(record) if record.owner != *owner => return Err(ReceiptError::ForeignOwner),
+            Some(record) => record,
+            None => return Err(state.terminal_error(receipt_id, owner)),
+        };
+
+        match &mut record.phase {
+            ReceiptPhase::Reserved { completion: stored } if stored.is_none() => {
+                *stored = Some(completion);
+                Ok(ExitPublicationOutcome::RetainedUntilDecision)
+            }
+            ReceiptPhase::Armed => {
+                record.phase = ReceiptPhase::Queued(completion);
+                Ok(ExitPublicationOutcome::Queued)
+            }
+            phase => Err(ReceiptError::InvalidTransition {
+                actual: phase.status(),
+            }),
+        }
+    }
+
+    /// Leases the single queued claim to either the pushed or terminal-stdin path.
+    pub(crate) fn lease_for_sampling(
+        &self,
+        receipt_id: ReceiptId,
+        owner: &ReceiptOwner,
+        source: SamplingSource,
+    ) -> Result<SamplingLease, ReceiptError> {
+        let mut state = self.lock_state()?;
+        let record = match state.active.get_mut(&receipt_id) {
+            Some(record) if record.owner != *owner => return Err(ReceiptError::ForeignOwner),
+            Some(record) => record,
+            None => return Err(state.terminal_error(receipt_id, owner)),
+        };
+
+        match &record.phase {
+            ReceiptPhase::Queued(completion) => {
+                let completion = *completion;
+                let token = Uuid::new_v4();
+                record.phase = ReceiptPhase::LeasedToSampling {
+                    completion,
+                    token,
+                    source,
+                };
+                Ok(SamplingLease {
+                    receipt_id,
+                    owner: owner.clone(),
+                    token,
+                    source,
+                })
+            }
+            ReceiptPhase::LeasedToSampling { .. } => Err(ReceiptError::AlreadyLeased),
+            phase => Err(ReceiptError::InvalidTransition {
+                actual: phase.status(),
+            }),
+        }
+    }
+
+    /// A failed sampling attempt requeues the same receipt without another claim.
+    pub(crate) fn fail_sampling(&self, lease: &SamplingLease) -> Result<(), ReceiptError> {
+        let mut state = self.lock_state()?;
+        let record = match state.active.get_mut(&lease.receipt_id) {
+            Some(record) if record.owner != lease.owner => return Err(ReceiptError::ForeignOwner),
+            Some(record) => record,
+            None => return Err(state.terminal_error(lease.receipt_id, &lease.owner)),
+        };
+
+        match &record.phase {
+            ReceiptPhase::LeasedToSampling {
+                completion,
+                token,
+                source,
+            } if *token == lease.token && *source == lease.source => {
+                let completion = *completion;
+                record.phase = ReceiptPhase::Queued(completion);
+                Ok(())
+            }
+            _ => Err(ReceiptError::StaleLease),
+        }
+    }
+
+    /// Acknowledges the claim only after its contents were included in sampling.
+    pub(crate) fn acknowledge_sampled(
+        &self,
+        lease: &SamplingLease,
+    ) -> Result<TerminalCompletion, ReceiptError> {
+        let mut state = self.lock_state()?;
+        let completion = match state.active.get(&lease.receipt_id) {
+            Some(record) if record.owner != lease.owner => return Err(ReceiptError::ForeignOwner),
+            Some(record) => match &record.phase {
+                ReceiptPhase::LeasedToSampling {
+                    completion,
+                    token,
+                    source,
+                } if *token == lease.token && *source == lease.source => *completion,
+                _ => return Err(ReceiptError::StaleLease),
+            },
+            None => return Err(state.terminal_error(lease.receipt_id, &lease.owner)),
+        };
+
+        state.retire(
+            lease.receipt_id,
+            ReceiptPhase::Sampled {
+                source: lease.source,
+            },
+        )?;
+        Ok(completion)
+    }
+
+    /// Cancels any reserved, armed, queued, or leased receipt and frees its slot.
+    pub(crate) fn cancel(
+        &self,
+        receipt_id: ReceiptId,
+        owner: &ReceiptOwner,
+        reason: CancellationReason,
+    ) -> Result<(), ReceiptError> {
+        let mut state = self.lock_state()?;
+        match state.active.get(&receipt_id) {
+            Some(record) if record.owner != *owner => return Err(ReceiptError::ForeignOwner),
+            Some(_) => {}
+            None => {
+                return match state.terminal_error(receipt_id, owner) {
+                    ReceiptError::UnknownReceipt => Err(ReceiptError::UnknownReceipt),
+                    ReceiptError::ForeignOwner => Err(ReceiptError::ForeignOwner),
+                    _ => Err(ReceiptError::AlreadyTerminal),
+                };
+            }
+        }
+
+        state.retire(receipt_id, ReceiptPhase::Cancelled(reason))
+    }
+
+    /// Returns the current state for the matching owner, including recent outcomes.
+    pub(crate) fn status(
+        &self,
+        receipt_id: ReceiptId,
+        owner: &ReceiptOwner,
+    ) -> Result<ReceiptStatus, ReceiptError> {
+        let state = self.lock_state()?;
+        match state.active.get(&receipt_id) {
+            Some(record) if record.owner != *owner => Err(ReceiptError::ForeignOwner),
+            Some(record) => Ok(record.phase.status()),
+            None => match state.terminal(receipt_id) {
+                Some(record) if record.owner != *owner => Err(ReceiptError::ForeignOwner),
+                Some(record) => Ok(record.phase.status()),
+                None => Err(ReceiptError::UnknownReceipt),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "completion_receipt_tests.rs"]
+mod tests;

@@ -48,6 +48,7 @@ use crate::tools::network_approval::DeferredNetworkApproval;
 use codex_core_plugins::PluginMetricsSidecar;
 
 mod async_watcher;
+pub(crate) mod completion_receipt;
 mod errors;
 mod head_tail_buffer;
 mod oneshot;
