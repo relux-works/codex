@@ -569,8 +569,8 @@ impl UnifiedExecProcessManager {
                 {
                     Ok(receipt_id) => Some((receipt_id, owner)),
                     Err(ReceiptError::CapacityExceeded { capacity }) => {
-                        self.release_process_id(request.process_id).await;
-                        return Err(UnifiedExecError::ReceiptCapacityExceeded { capacity });
+                        let _ = capacity;
+                        None
                     }
                     Err(err) => {
                         self.release_process_id(request.process_id).await;
