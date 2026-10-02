@@ -873,15 +873,11 @@ impl UnifiedExecProcessManager {
                     )
                     .await;
                     if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
-                        self.settle_opted_in_inline(
+                        let _ = self.receipt_store.resolve_initial_response(
                             *receipt_id,
                             owner,
-                            TerminalCompletion {
-                                exit_code,
-                                timed_out: process.timed_out(),
-                            },
-                        )
-                        .await;
+                            InitialResponseDecision::Arm,
+                        );
                     }
                     (None, exit_code)
                 }
@@ -924,15 +920,11 @@ impl UnifiedExecProcessManager {
             }
             let exit_code = process.exit_code();
             if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
-                self.settle_opted_in_inline(
+                let _ = self.receipt_store.resolve_initial_response(
                     *receipt_id,
                     owner,
-                    TerminalCompletion {
-                        exit_code,
-                        timed_out: process.timed_out(),
-                    },
-                )
-                .await;
+                    InitialResponseDecision::Arm,
+                );
             }
             let exit = exit_code.unwrap_or(-1);
             initial_exec_command_guard
