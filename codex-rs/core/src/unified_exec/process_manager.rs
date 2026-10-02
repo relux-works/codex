@@ -1954,7 +1954,7 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
-        self.cancel_all_completion_receipts(CancellationReason::Shutdown)
+        self.cancel_all_completion_receipts(CancellationReason::Released)
             .await;
         let entries: Vec<ProcessEntry> = {
             let mut processes = self.process_store.lock().await;
