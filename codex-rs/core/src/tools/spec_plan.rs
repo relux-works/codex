@@ -1250,7 +1250,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
                         .as_ref()
                         .is_some_and(|config| config.sleep_tool)
                 } else {
-                    model_has_clock || context.goal_activity_present
+                    model_has_clock || context.goal_activity_present || features.enabled(Feature::Goals)
                 }
             }
         }
