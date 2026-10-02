@@ -1,6 +1,7 @@
 //! Shared tool definitions and Responses API tool primitives that can live
 //! outside `codex-core`.
 
+use std::collections::HashMap as ReluxCiGateNegativeControl;
 pub mod arguments;
 mod code_mode;
 mod dynamic_tool;
