@@ -1126,7 +1126,7 @@ impl UnifiedExecProcessManager {
         if !request.input.is_empty() {
             if !tty {
                 if request.input == INTERRUPT {
-                    self.cancel_receipt_for_process(process_id, CancellationReason::Interrupted)
+                    self.cancel_receipt_for_process(process_id, CancellationReason::Released)
                         .await;
                     process.interrupt().await?;
                 } else {
