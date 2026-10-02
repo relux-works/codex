@@ -66,10 +66,27 @@ impl Debug for ReceiptId {
 }
 
 /// The finalized process outcome retained by the receipt state machine.
+///
+/// `exit_code` is `None` when the process failed without producing an exit
+/// code (for example a failure message), mirroring the failed
+/// `ExecCommandEnd` event. Otherwise it carries the observed exit code and
+/// `timed_out` preserves the process timeout flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalCompletion {
     pub(crate) exit_code: Option<i32>,
     pub(crate) timed_out: bool,
+}
+
+/// Internal opt-in for exit notification on an exec launch.
+///
+/// This is never exposed to the model and never changes the tool schema;
+/// exposing `notify_on_exit` is a later story. Default launches behave
+/// exactly as before and never reserve a receipt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExecCompletionMode {
+    #[default]
+    Default,
+    NotifyOnExit,
 }
 
 /// The initial tool response either returns a terminal result or arms a wake.
@@ -133,6 +150,8 @@ pub(crate) enum ReceiptError {
     AlreadyConsumed,
     #[error("receipt was cancelled: {reason:?}")]
     Cancelled { reason: CancellationReason },
+    #[error("receipt output was retired to free capacity")]
+    Retired,
     #[error("receipt is not valid for this operation in state {actual:?}")]
     InvalidTransition { actual: ReceiptStatus },
     #[error("sampling lease is stale or no longer owns this receipt")]
@@ -157,6 +176,12 @@ pub(crate) struct SamplingLease {
 impl Debug for SamplingLease {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SamplingLease(<opaque>)")
+    }
+}
+
+impl SamplingLease {
+    pub(crate) fn receipt_id(&self) -> ReceiptId {
+        self.receipt_id
     }
 }
 
@@ -509,6 +534,15 @@ impl CompletionReceiptStore {
         }
 
         state.retire(receipt_id, ReceiptPhase::Cancelled(reason))
+    }
+
+    /// Returns the number of receipts currently holding an active slot.
+    ///
+    /// Terminal outcomes (inline, sampled, cancelled) move to the bounded
+    /// terminal history and no longer count here. The unified exec hooks add
+    /// sampled receipts with retained output on top to size combined capacity.
+    pub(crate) fn active_len(&self) -> Result<usize, ReceiptError> {
+        Ok(self.lock_state()?.active.len())
     }
 
     /// Returns the current state for the matching owner, including recent outcomes.

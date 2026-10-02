@@ -55,6 +55,8 @@ mod oneshot;
 mod process;
 mod process_manager;
 mod process_state;
+mod receipt_hooks;
+mod receipt_output;
 mod shell_snapshot;
 mod stdin_approval;
 
@@ -168,9 +170,22 @@ impl ProcessStore {
     }
 }
 
+/// Receipt context carried by the exit watcher for an opted-in process.
+///
+/// Default launches pass `None`, keeping watcher behavior unchanged.
+pub(crate) struct ExitWatcherReceiptHook {
+    pub receipt_id: completion_receipt::ReceiptId,
+    pub owner: completion_receipt::ReceiptOwner,
+    pub store: Arc<completion_receipt::CompletionReceiptStore>,
+    pub hooks: Arc<Mutex<receipt_hooks::ReceiptHooksState>>,
+}
+
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Mutex<ProcessStore>,
     max_write_stdin_yield_time_ms: u64,
+    receipt_store: Arc<completion_receipt::CompletionReceiptStore>,
+    receipt_hooks: Arc<Mutex<receipt_hooks::ReceiptHooksState>>,
+    receipt_generation: u64,
 }
 
 impl UnifiedExecProcessManager {
@@ -179,6 +194,9 @@ impl UnifiedExecProcessManager {
             process_store: Mutex::new(ProcessStore::default()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
+            receipt_store: Arc::new(completion_receipt::CompletionReceiptStore::default()),
+            receipt_hooks: Arc::new(Mutex::new(receipt_hooks::ReceiptHooksState::default())),
+            receipt_generation: receipt_hooks::next_receipt_generation(),
         }
     }
 }
