@@ -18,9 +18,12 @@ use codex_core::TimeFuture;
 use codex_core::TimeProvider;
 use codex_core::TurnInputRequest;
 use codex_core::config::CurrentTimeReminderConfig;
+use codex_extension_api::GoalActivity;
+use codex_extension_api::GoalActivityState;
 use codex_features::CurrentTimeReminderDeliveryMode;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
+use codex_features::SleepToolMode;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
@@ -45,6 +48,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use serde_json::json;
 use test_case::test_case;
 
@@ -129,6 +133,38 @@ fn current_time_reminders(request: &ResponsesRequest) -> Vec<String> {
         .into_iter()
         .filter(|text| text.starts_with("<current_time_reminder>"))
         .collect()
+}
+
+fn goal_activity(state: GoalActivityState, revision: u64) -> GoalActivity {
+    GoalActivity {
+        goal_id: "goal-1".to_string(),
+        revision,
+        state,
+    }
+}
+
+fn tool_catalog_without_sleep(request: &ResponsesRequest) -> Vec<Value> {
+    let mut tools = request.body_json()["tools"]
+        .as_array()
+        .expect("request should contain tools")
+        .clone();
+    for tool in &mut tools {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace")
+            && tool.get("name").and_then(Value::as_str) == Some("clock")
+            && let Some(children) = tool.get_mut("tools").and_then(Value::as_array_mut)
+        {
+            children.retain(|child| child.get("name").and_then(Value::as_str) != Some("sleep"));
+        }
+    }
+    tools.retain(|tool| {
+        tool.get("type").and_then(Value::as_str) != Some("namespace")
+            || tool.get("name").and_then(Value::as_str) != Some("clock")
+            || tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .is_some_and(|children| !children.is_empty())
+    });
+    tools
 }
 
 fn enable_current_time_reminder(
@@ -552,6 +588,210 @@ async fn sleep_tool_configuration_controls_registration(
     assert_eq!(
         current_time_reminders(&request).is_empty(),
         legacy_sleep_tool.is_none()
+    );
+    Ok(())
+}
+
+#[test_case(false; "direct_tools")]
+#[test_case(true; "code_mode")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_activity_controls_model_driven_sleep_on_each_sampling_request(
+    code_mode: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+            sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+            sse(vec![ev_response_created("resp-3"), ev_completed("resp-3")]),
+            sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info
+                .experimental_supported_tools
+                .retain(|tool| tool != "clock");
+        })
+        .with_config(move |config| {
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            config
+                .features
+                .disable(Feature::CurrentTimeReminder)
+                .expect("test config should allow disabling current-time reminders");
+            config.sleep_tool_mode = SleepToolMode::ModelDriven;
+            if code_mode {
+                config
+                    .features
+                    .enable(Feature::CodeMode)
+                    .expect("test config should allow code mode");
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    let thread_data = test.codex.thread_extension_data();
+    assert!(
+        thread_data
+            .insert("unrelated extension data".to_string())
+            .is_none()
+    );
+    test.submit_text_turn("inspect available clock tools")
+        .await?;
+
+    assert!(
+        thread_data
+            .insert(goal_activity(
+                GoalActivityState::Active,
+                /*revision*/ 1
+            ))
+            .is_none()
+    );
+    test.submit_text_turn("inspect available clock tools")
+        .await?;
+
+    assert!(
+        thread_data
+            .insert(goal_activity(
+                GoalActivityState::BudgetLimited,
+                /*revision*/ 2
+            ))
+            .is_some()
+    );
+    test.submit_text_turn("inspect available clock tools")
+        .await?;
+
+    assert!(thread_data.remove::<GoalActivity>().is_some());
+    test.submit_text_turn("inspect available clock tools")
+        .await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.tool_by_name("clock", "sleep").is_some())
+            .collect::<Vec<_>>(),
+        [false, true, true, false]
+    );
+    let baseline_tools = tool_catalog_without_sleep(&requests[0]);
+    assert!(
+        requests
+            .iter()
+            .all(|request| tool_catalog_without_sleep(request) == baseline_tools)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_sleep_tool_feature_wins_over_goal_activity() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info
+                .experimental_supported_tools
+                .retain(|tool| tool != "clock");
+        })
+        .with_config(|config| {
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            config
+                .features
+                .disable(Feature::CurrentTimeReminder)
+                .expect("test config should allow disabling current-time reminders");
+            config
+                .features
+                .disable(Feature::SleepTool)
+                .expect("test config should allow disabling the sleep tool");
+            config.sleep_tool_mode = SleepToolMode::ModelDriven;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    assert!(
+        test.codex
+            .thread_extension_data()
+            .insert(goal_activity(
+                GoalActivityState::Active,
+                /*revision*/ 1
+            ))
+            .is_none()
+    );
+
+    test.submit_text_turn("inspect available clock tools")
+        .await?;
+
+    assert!(
+        responses
+            .single_request()
+            .tool_by_name("clock", "sleep")
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test_case(Some(false), false; "explicit_false")]
+#[test_case(None, false; "missing_config")]
+#[test_case(Some(true), true; "explicit_true")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_time_reminder_sleep_setting_overrides_goal_activity(
+    sleep_tool: Option<bool>,
+    expected_sleep: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model_info_override("gpt-5.5", |model_info| {
+            model_info
+                .experimental_supported_tools
+                .retain(|tool| tool != "clock");
+        })
+        .with_config(move |config| {
+            config.model_reasoning_effort = Some(ReasoningEffort::High);
+            config
+                .features
+                .enable(Feature::CurrentTimeReminder)
+                .expect("test config should allow current-time reminders");
+            config.current_time_reminder = sleep_tool.map(|sleep_tool| CurrentTimeReminderConfig {
+                sleep_tool,
+                ..CurrentTimeReminderConfig::default()
+            });
+            config.sleep_tool_mode = SleepToolMode::ModelDriven;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    assert!(
+        test.codex
+            .thread_extension_data()
+            .insert(goal_activity(
+                GoalActivityState::Active,
+                /*revision*/ 1
+            ))
+            .is_none()
+    );
+
+    test.submit_text_turn("inspect available clock tools")
+        .await?;
+
+    let request = responses.single_request();
+    assert_eq!(
+        ["curr_time", "sleep"].map(|name| request.tool_by_name("clock", name).is_some()),
+        [true, expected_sleep]
     );
     Ok(())
 }

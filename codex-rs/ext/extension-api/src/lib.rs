@@ -1,5 +1,6 @@
 mod capabilities;
 mod contributors;
+mod goal_activity;
 mod registry;
 mod session_isolation;
 mod state;
@@ -7,6 +8,8 @@ mod tool_policy;
 mod turn_admission;
 mod user_instructions;
 
+pub use goal_activity::GoalActivity;
+pub use goal_activity::GoalActivityState;
 pub use session_isolation::IsolatedSessionExtensions;
 pub use session_isolation::SessionIsolation;
 pub use tool_policy::ToolPolicy;

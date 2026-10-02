@@ -5,7 +5,22 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use codex_extension_api::ExtensionData;
+use codex_extension_api::GoalActivity;
+use codex_extension_api::GoalActivityState;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn goal_activity_can_be_inserted_as_typed_thread_data() {
+    let data = ExtensionData::new("thread-1");
+    let marker = GoalActivity {
+        goal_id: "goal-1".to_string(),
+        revision: 4,
+        state: GoalActivityState::BudgetLimited,
+    };
+
+    assert_eq!(data.insert(marker.clone()), None);
+    assert_eq!(data.get::<GoalActivity>().as_deref(), Some(&marker));
+}
 
 #[test]
 fn typed_values_can_be_inserted_replaced_and_removed() {
