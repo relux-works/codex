@@ -245,6 +245,9 @@ where
                 return;
             }
 
+            if input.token_usage_at_turn_start.is_none() {
+                return;
+            }
             let goal = {
                 let permit =
                     if let Some(shared) = input.thread_store.remove::<GoalTurnStartPermit>() {
