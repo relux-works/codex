@@ -2011,7 +2011,7 @@ impl UnifiedExecProcessManager {
             (Arc::clone(&entry.process), entry.process.has_exited())
         };
 
-        self.cancel_receipt_for_process(process_id, CancellationReason::OwnerStopped)
+        self.cancel_receipt_for_process(process_id, CancellationReason::Released)
             .await;
         if !already_exited && process.terminate_confirmed().await.is_err() {
             return false;
