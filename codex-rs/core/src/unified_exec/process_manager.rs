@@ -538,7 +538,13 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         completion_mode: ExecCompletionMode,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.exec_command_inner(request, context, /*completion*/ None, completion_mode)
+        let _ = completion_mode;
+        self.exec_command_inner(
+            request,
+            context,
+            /*completion*/ None,
+            ExecCompletionMode::NotifyOnExit,
+        )
             .await
     }
 
