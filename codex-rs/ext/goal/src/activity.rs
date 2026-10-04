@@ -78,6 +78,9 @@ impl GoalActivityPublisher {
         let goal = match goal {
             Ok(goal) => goal,
             Err(error) => {
+                if error.contains("invalid unix timestamp millis") {
+                    return Err(error);
+                }
                 publication.revision += 1;
                 publication.goal = ReconciledGoal::Unknown;
                 store.remove::<GoalActivity>();
