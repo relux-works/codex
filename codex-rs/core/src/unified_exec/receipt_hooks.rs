@@ -260,7 +260,7 @@ impl UnifiedExecProcessManager {
         };
         match self
             .receipt_store
-            .cancel(receipt_id, owner, CancellationReason::Released)
+            .cancel(receipt_id, owner, CancellationReason::OwnerStopped)
         {
             Ok(()) | Err(ReceiptError::AlreadyTerminal) => Ok(()),
             Err(ReceiptError::UnknownReceipt) if had_output => Ok(()),
