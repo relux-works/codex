@@ -118,14 +118,18 @@ impl GoalService {
         let Some(runtime) = self.runtime_for_thread(thread_id) else {
             return Ok(());
         };
-        let _goal_state_permit = runtime
+        let goal_state_permit = runtime
             .goal_state_permit()
             .await
             .map_err(GoalServiceError::Internal)?;
-        runtime
-            .prepare_external_goal_mutation()
+        if let Err(err) = runtime
+            .prepare_external_goal_mutation_locked(&goal_state_permit)
             .await
-            .map_err(GoalServiceError::Internal)
+        {
+            runtime.revoke_live_activity_on_read_failure(&err).await;
+            return Err(GoalServiceError::Internal(err));
+        }
+        Ok(())
     }
 
     pub async fn get_thread_goal(
@@ -176,7 +180,7 @@ impl GoalService {
         let runtime = self.runtime_for_thread(thread_id);
         // Hold this through the prepare/write window so idle continuation cannot
         // launch from goal state that this external mutation is about to change.
-        let _goal_state_permit = match runtime.as_ref() {
+        let goal_state_permit = match runtime.as_ref() {
             Some(runtime) => Some(
                 runtime
                     .goal_state_permit()
@@ -186,19 +190,16 @@ impl GoalService {
             None => None,
         };
         if let Some(runtime) = runtime.as_ref()
-            && let Err(err) = runtime.prepare_external_goal_mutation().await
+            && let Some(permit) = goal_state_permit.as_ref()
+            && let Err(err) = runtime.prepare_external_goal_mutation_locked(permit).await
         {
             tracing::warn!("failed to prepare external goal mutation: {err}");
+            runtime.revoke_live_activity_on_read_failure(&err).await;
         }
 
         let (goal, previous_goal) = if let Some(objective) = objective {
-            let existing_goal = state_db
-                .thread_goals()
-                .get_thread_goal(thread_id)
-                .await
-                .map_err(|err| {
-                    GoalServiceError::Internal(format!("failed to read thread goal: {err}"))
-                })?;
+            let existing_goal =
+                Self::read_thread_goal_for_set(runtime.as_ref(), state_db, thread_id).await?;
             if let Some(existing_goal) = existing_goal.as_ref() {
                 let previous_goal = PreviousGoalSnapshot::from(existing_goal);
                 state_db
@@ -238,18 +239,14 @@ impl GoalService {
                     .map(|goal| (goal, None))?
             }
         } else {
-            let existing_goal = state_db
-                .thread_goals()
-                .get_thread_goal(thread_id)
-                .await
-                .map_err(|err| {
-                    GoalServiceError::Internal(format!("failed to read thread goal: {err}"))
-                })?
-                .ok_or_else(|| {
-                    GoalServiceError::InvalidRequest(format!(
-                        "cannot update goal for thread {thread_id}: no goal exists"
-                    ))
-                })?;
+            let existing_goal =
+                Self::read_thread_goal_for_set(runtime.as_ref(), state_db, thread_id)
+                    .await?
+                    .ok_or_else(|| {
+                        GoalServiceError::InvalidRequest(format!(
+                            "cannot update goal for thread {thread_id}: no goal exists"
+                        ))
+                    })?;
             let previous_goal = PreviousGoalSnapshot::from(&existing_goal);
             let expected_goal_id = existing_goal.goal_id.clone();
             state_db
@@ -275,7 +272,13 @@ impl GoalService {
                 .map(|goal| (goal, Some(previous_goal)))?
         };
 
-        if let Some(runtime) = runtime.as_ref() {
+        if let Some(runtime) = runtime.as_ref()
+            && let Some(permit) = goal_state_permit.as_ref()
+        {
+            runtime
+                .reconcile_live_activity(permit)
+                .await
+                .map_err(GoalServiceError::Internal)?;
             runtime.clear_pending_turn_start_options().await;
         }
 
@@ -307,7 +310,8 @@ impl GoalService {
             None => None,
         };
         if let Some(runtime) = runtime.as_ref()
-            && let Err(err) = runtime.prepare_external_goal_mutation().await
+            && let Some(permit) = goal_state_permit.as_ref()
+            && let Err(err) = runtime.prepare_external_goal_mutation_locked(permit).await
         {
             tracing::warn!("failed to prepare external goal mutation: {err}");
         }
@@ -319,6 +323,12 @@ impl GoalService {
             .map_err(|err| {
                 GoalServiceError::Internal(format!("failed to clear thread goal: {err}"))
             })?;
+        if let Some(runtime) = runtime.as_ref()
+            && let Some(permit) = goal_state_permit.as_ref()
+        {
+            // A committed clear revokes capability even while Goals is disabled.
+            runtime.clear_activity(permit).await;
+        }
         let cleared = cleared_goal.is_some();
         if cleared && let Some(runtime) = runtime.as_ref() {
             runtime.clear_pending_turn_start_options().await;
@@ -333,6 +343,26 @@ impl GoalService {
         }
 
         Ok(cleared)
+    }
+
+    /// Reads the committed goal for an external set. A read failure revokes
+    /// the live marker through the sole publisher before it is reported, so a
+    /// previously published marker never survives an unverified read.
+    async fn read_thread_goal_for_set(
+        runtime: Option<&Arc<GoalRuntimeHandle>>,
+        state_db: &codex_state::StateRuntime,
+        thread_id: ThreadId,
+    ) -> Result<Option<codex_state::ThreadGoal>, GoalServiceError> {
+        match state_db.thread_goals().get_thread_goal(thread_id).await {
+            Ok(goal) => Ok(goal),
+            Err(err) => {
+                let message = format!("failed to read thread goal: {err}");
+                if let Some(runtime) = runtime {
+                    runtime.revoke_live_activity_on_read_failure(&message).await;
+                }
+                Err(GoalServiceError::Internal(message))
+            }
+        }
     }
 
     pub(crate) fn register_runtime(&self, runtime: &Arc<GoalRuntimeHandle>) {
