@@ -181,6 +181,15 @@ pub(crate) fn spawn_exit_watcher(
 
     tokio::spawn(async move {
         exit_token.cancelled().await;
+        if let Some(hook) = receipt_hook.as_ref() {
+            let completion = TerminalCompletion {
+                exit_code: process.exit_code(),
+                timed_out: process.timed_out(),
+            };
+            let _ = hook
+                .store
+                .publish_exit(hook.receipt_id, &hook.owner, completion);
+        }
         output_drained.notified().await;
         // Deferred network denial deliberately remains observable for a short
         // window after process exit. Do not classify the terminal event until
