@@ -94,7 +94,9 @@ impl GoalActivityPublisher {
             Some(goal)
                 if matches!(
                     goal.status,
-                    ThreadGoalStatus::Active | ThreadGoalStatus::BudgetLimited
+                    ThreadGoalStatus::Active
+                        | ThreadGoalStatus::BudgetLimited
+                        | ThreadGoalStatus::UsageLimited
                 ) =>
             {
                 store.insert(GoalActivity {
