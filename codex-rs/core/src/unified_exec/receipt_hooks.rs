@@ -249,7 +249,6 @@ impl UnifiedExecProcessManager {
         let had_output = match hooks.retention.lookup(receipt_id, owner) {
             RetentionLookup::ForeignOwner => return Err(ReceiptError::ForeignOwner),
             RetentionLookup::Present { .. } | RetentionLookup::Retired => {
-                hooks.retention.drop(receipt_id);
                 hooks.remove_binding(receipt_id);
                 true
             }
