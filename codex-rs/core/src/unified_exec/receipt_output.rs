@@ -123,7 +123,7 @@ impl RetentionState {
         let victim = self
             .sampled
             .iter()
-            .min_by_key(|(_, output)| output.sampled_seq)
+            .max_by_key(|(_, output)| output.sampled_seq)
             .map(|(receipt_id, _)| *receipt_id)?;
         let output = self.sampled.remove(&victim)?;
         self.retired.insert(
