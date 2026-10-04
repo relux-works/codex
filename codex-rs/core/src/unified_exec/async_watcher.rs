@@ -203,7 +203,7 @@ pub(crate) fn spawn_exit_watcher(
                 },
                 None => TerminalCompletion {
                     exit_code: process.exit_code(),
-                    timed_out: process.timed_out(),
+                    timed_out: false,
                 },
             };
             if hook
