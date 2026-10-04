@@ -15,6 +15,7 @@ use super::UnifiedExecContext;
 use super::UnifiedExecError;
 use super::UnifiedExecProcess;
 use super::UnifiedExecProcessManager;
+use super::completion_receipt::ExecCompletionMode;
 use super::trace_id;
 use crate::tools::context::ExecCommandToolOutput;
 
@@ -70,8 +71,12 @@ impl UnifiedExecProcessManager {
                 process: &process,
             };
             let result = {
-                let mut execution =
-                    Box::pin(manager.exec_command_inner(request, &context, Some(&mut completion)));
+                let mut execution = Box::pin(manager.exec_command_inner(
+                    request,
+                    &context,
+                    Some(&mut completion),
+                    ExecCompletionMode::Default,
+                ));
                 tokio::select! {
                     biased;
                     _ = context.cancellation_token.cancelled() => {

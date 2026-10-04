@@ -7,8 +7,10 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::Sleep;
 
+use super::ExitWatcherReceiptHook;
 use super::SharedPluginMetricsSidecar;
 use super::UnifiedExecContext;
+use super::completion_receipt::TerminalCompletion;
 use super::process::OutputBuffers;
 use super::process::OutputHandles;
 use super::process::UnifiedExecProcess;
@@ -166,6 +168,7 @@ pub(crate) fn spawn_exit_watcher(
     started_at: Instant,
     network_denial_monitor: Option<tokio::task::JoinHandle<()>>,
     plugin_metrics_sidecar: Option<SharedPluginMetricsSidecar>,
+    receipt_hook: Option<ExitWatcherReceiptHook>,
 ) {
     let session_ref = Arc::clone(&context.session);
     let turn_ref = Arc::clone(&context.step_context.turn);
@@ -187,11 +190,48 @@ pub(crate) fn spawn_exit_watcher(
         }
         let _interaction_guard = interaction_lock.lock_owned().await;
 
+        // Publish the finalized exit only here: after exit, output drain,
+        // denial-monitor settling, and final classification. Publication
+        // failures (released, cancelled, or already inline) are ignored so
+        // the terminal event below stays exactly as before.
+        let failure_message = process.failure_message();
+        if let Some(hook) = receipt_hook.as_ref() {
+            let completion = match failure_message.as_ref() {
+                Some(_) => TerminalCompletion {
+                    exit_code: None,
+                    timed_out: process.timed_out(),
+                },
+                None => TerminalCompletion {
+                    exit_code: process.exit_code(),
+                    timed_out: process.timed_out(),
+                },
+            };
+            if hook
+                .store
+                .publish_exit(hook.receipt_id, &hook.owner, completion)
+                .is_ok()
+            {
+                let (transcript, omitted_bytes) = {
+                    let guard = output_buffer.lock().await;
+                    (
+                        guard.transcript.to_bytes(),
+                        guard.transcript.omitted_bytes(),
+                    )
+                };
+                hook.hooks.lock().await.retention.insert_pending(
+                    hook.receipt_id,
+                    hook.owner.clone(),
+                    transcript,
+                    omitted_bytes,
+                );
+            }
+        }
+
         let duration = Instant::now().saturating_duration_since(started_at);
         let plugin_metrics_sidecar = plugin_metrics_sidecar
             .as_ref()
             .and_then(take_plugin_metrics_sidecar);
-        if let Some(message) = process.failure_message() {
+        if let Some(message) = failure_message {
             drop(plugin_metrics_sidecar);
             emit_failed_exec_end_for_unified_exec(
                 process.sandbox_type(),

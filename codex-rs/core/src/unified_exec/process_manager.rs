@@ -44,6 +44,7 @@ use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::unified_exec::ExecCommandRequest;
+use crate::unified_exec::ExitWatcherReceiptHook;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
@@ -60,6 +61,11 @@ use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time;
+use crate::unified_exec::completion_receipt::CancellationReason;
+use crate::unified_exec::completion_receipt::ExecCompletionMode;
+use crate::unified_exec::completion_receipt::InitialResponseDecision;
+use crate::unified_exec::completion_receipt::ReceiptError;
+use crate::unified_exec::completion_receipt::TerminalCompletion;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::OutputBuffers;
@@ -377,6 +383,13 @@ async fn finish_deferred_network_approval_after_process_exit_for_session(
     finish_deferred_network_approval_for_session(session, deferred).await
 }
 
+fn failed_terminal_completion(process: &UnifiedExecProcess) -> TerminalCompletion {
+    TerminalCompletion {
+        exit_code: None,
+        timed_out: process.timed_out(),
+    }
+}
+
 fn fail_process_with_message(process: &UnifiedExecProcess, message: String) -> UnifiedExecError {
     if let Some(message) = process.failure_message() {
         process.terminate();
@@ -482,6 +495,7 @@ impl UnifiedExecProcessManager {
             }
             entry
         };
+        self.unbind_process_from_receipt(process_id).await;
         if let Some(entry) = removed {
             unregister_network_approval_for_entry(&entry).await;
         }
@@ -506,7 +520,7 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let result = self
-            .exec_command_inner(request, context, /*completion*/ None)
+            .exec_command_with_completion_mode(request, context, ExecCompletionMode::Default)
             .await;
         let outcome = match &result {
             Ok(output) if output.process_id.is_some() => "yielded",
@@ -518,12 +532,55 @@ impl UnifiedExecProcessManager {
         result
     }
 
+    pub(crate) async fn exec_command_with_completion_mode(
+        &self,
+        request: ExecCommandRequest,
+        context: &UnifiedExecContext,
+        completion_mode: ExecCompletionMode,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        self.exec_command_inner(request, context, /*completion*/ None, completion_mode)
+            .await
+    }
+
     pub(super) async fn exec_command_inner(
         &self,
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
         mut completion: Option<&mut Completion<'_>>,
+        completion_mode: ExecCompletionMode,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        let opted_in_receipt = match completion_mode {
+            ExecCompletionMode::Default => None,
+            ExecCompletionMode::NotifyOnExit => {
+                let owner = match self.receipt_owner_for(context) {
+                    Ok(owner) => owner,
+                    Err(err) => {
+                        self.release_process_id(request.process_id).await;
+                        return Err(UnifiedExecError::create_process(format!(
+                            "completion receipt owner: {err}"
+                        )));
+                    }
+                };
+                // Reserve before launching so a full store refuses before any
+                // process starts.
+                match self
+                    .reserve_completion_receipt(owner.clone(), request.process_id)
+                    .await
+                {
+                    Ok(receipt_id) => Some((receipt_id, owner)),
+                    Err(ReceiptError::CapacityExceeded { capacity }) => {
+                        self.release_process_id(request.process_id).await;
+                        return Err(UnifiedExecError::ReceiptCapacityExceeded { capacity });
+                    }
+                    Err(err) => {
+                        self.release_process_id(request.process_id).await;
+                        return Err(UnifiedExecError::create_process(format!(
+                            "completion receipt reservation: {err}"
+                        )));
+                    }
+                }
+            }
+        };
         let cwd = request.cwd.clone();
         let process = self
             .open_session_with_sandbox(&request, cwd.clone(), context)
@@ -532,6 +589,13 @@ impl UnifiedExecProcessManager {
         let (attempt, mut deferred_network_approval) = match process {
             Ok((attempt, deferred_network_approval)) => (attempt, deferred_network_approval),
             Err(err) => {
+                if opted_in_receipt.is_some() {
+                    self.cancel_receipt_for_process(
+                        request.process_id,
+                        CancellationReason::OwnerStopped,
+                    )
+                    .await;
+                }
                 self.release_process_id(request.process_id).await;
                 return Err(err);
             }
@@ -596,6 +660,9 @@ impl UnifiedExecProcessManager {
         // Persist live sessions before the initial yield wait so interrupting the
         // turn cannot drop the last Arc and terminate the background process.
         let process_started_alive = !process.has_exited() && process.exit_code().is_none();
+        let receipt_hook = opted_in_receipt
+            .as_ref()
+            .map(|(receipt_id, owner)| self.watcher_receipt_hook(*receipt_id, owner.clone()));
         let mut initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
             self.store_process(
@@ -615,6 +682,7 @@ impl UnifiedExecProcessManager {
                 metrics_sidecar,
                 Arc::clone(&output_buffer),
                 Arc::clone(&initial_exec_command_active),
+                receipt_hook,
             )
             .await;
             InitialExecCommandGuard {
@@ -673,6 +741,14 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.take(),
             )
             .await;
+            if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                self.settle_opted_in_inline(
+                    *receipt_id,
+                    owner,
+                    failed_terminal_completion(&process),
+                )
+                .await;
+            }
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 process.sandbox_type(),
@@ -695,6 +771,14 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.take(),
             )
             .await;
+            if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                self.settle_opted_in_inline(
+                    *receipt_id,
+                    owner,
+                    failed_terminal_completion(&process),
+                )
+                .await;
+            }
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 process.sandbox_type(),
@@ -721,7 +805,19 @@ impl UnifiedExecProcessManager {
                     exit_code,
                     process_id,
                     ..
-                } => (Some(process_id), exit_code),
+                } => {
+                    if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                        // Arm the subscription; a concurrent exit publication
+                        // already queued the completion and is equally
+                        // exactly-once.
+                        let _ = self.receipt_store.resolve_initial_response(
+                            *receipt_id,
+                            owner,
+                            InitialResponseDecision::Arm,
+                        );
+                    }
+                    (Some(process_id), exit_code)
+                }
                 ProcessStatus::Exited { exit_code, entry } => {
                     if let Err(message) =
                         finish_deferred_network_approval_after_process_exit_for_session(
@@ -730,21 +826,38 @@ impl UnifiedExecProcessManager {
                         )
                         .await
                     {
+                        if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                            self.settle_opted_in_inline(
+                                *receipt_id,
+                                owner,
+                                failed_terminal_completion(&entry.process),
+                            )
+                            .await;
+                        }
                         return Err(fail_process_with_message(entry.process.as_ref(), message));
                     }
                     if !completion
                         .as_ref()
                         .is_some_and(|completion| completion.timed_out)
+                        && let Err(err) = process.check_for_sandbox_denial_with_text(&text).await
                     {
-                        process
-                            .check_for_sandbox_denial_with_text(&text)
-                            .await
-                            .map_err(|err| {
-                                err.with_output_collection_metadata(
-                                    original_token_count,
-                                    output_omitted_bytes,
-                                )
-                            })?;
+                        if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                            // Sandbox denial surfaces to the model with the
+                            // exit code, so the inline completion carries it.
+                            self.settle_opted_in_inline(
+                                *receipt_id,
+                                owner,
+                                TerminalCompletion {
+                                    exit_code,
+                                    timed_out: process.timed_out(),
+                                },
+                            )
+                            .await;
+                        }
+                        return Err(err.with_output_collection_metadata(
+                            original_token_count,
+                            output_omitted_bytes,
+                        ));
                     }
                     let metrics_sidecar = entry
                         .plugin_metrics_sidecar
@@ -759,6 +872,17 @@ impl UnifiedExecProcessManager {
                         &context.call_id,
                     )
                     .await;
+                    if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                        self.settle_opted_in_inline(
+                            *receipt_id,
+                            owner,
+                            TerminalCompletion {
+                                exit_code,
+                                timed_out: process.timed_out(),
+                            },
+                        )
+                        .await;
+                    }
                     (None, exit_code)
                 }
                 ProcessStatus::Unknown => {
@@ -774,6 +898,14 @@ impl UnifiedExecProcessManager {
             )
             .await;
             if let Err(message) = finish_result {
+                if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                    self.settle_opted_in_inline(
+                        *receipt_id,
+                        owner,
+                        failed_terminal_completion(&process),
+                    )
+                    .await;
+                }
                 emit_failed_initial_exec_end_if_unstored(
                     process_started_alive,
                     process.sandbox_type(),
@@ -791,6 +923,17 @@ impl UnifiedExecProcessManager {
                 return Err(fail_process_with_message(process.as_ref(), message));
             }
             let exit_code = process.exit_code();
+            if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
+                self.settle_opted_in_inline(
+                    *receipt_id,
+                    owner,
+                    TerminalCompletion {
+                        exit_code,
+                        timed_out: process.timed_out(),
+                    },
+                )
+                .await;
+            }
             let exit = exit_code.unwrap_or(-1);
             initial_exec_command_guard
                 .finish_plugin_metrics(context, exit)
@@ -983,6 +1126,8 @@ impl UnifiedExecProcessManager {
         if !request.input.is_empty() {
             if !tty {
                 if request.input == INTERRUPT {
+                    self.cancel_receipt_for_process(process_id, CancellationReason::Interrupted)
+                        .await;
                     process.interrupt().await?;
                 } else {
                     return Err(UnifiedExecError::StdinClosed);
@@ -1078,10 +1223,16 @@ impl UnifiedExecProcessManager {
                 {
                     return Err(fail_process_with_message(entry.process.as_ref(), message));
                 }
+                // Claim through the process binding before dropping it: the
+                // binding is how the terminal stdin path finds its receipt.
+                self.claim_terminal_stdin_output(process_id).await;
+                self.unbind_process_from_receipt(process_id).await;
                 (None, exit_code, call_id)
             }
             ProcessStatus::Unknown => {
                 if process.has_exited() {
+                    self.claim_terminal_stdin_output(process_id).await;
+                    self.unbind_process_from_receipt(process_id).await;
                     (None, process.exit_code(), call_id)
                 } else {
                     return Err(UnifiedExecError::UnknownProcessId {
@@ -1126,29 +1277,35 @@ impl UnifiedExecProcessManager {
     }
 
     async fn refresh_process_state(&self, process_id: i32) -> ProcessStatus {
-        let mut store = self.process_store.lock().await;
-        let Some(entry) = store.processes.get_mut(&process_id) else {
-            return ProcessStatus::Unknown;
-        };
-
-        let exit_code = entry.process.exit_code();
-        let process_id = entry.process_id;
-
-        if entry.process.has_exited() {
-            let Some(entry) = store.remove(process_id) else {
+        let outcome = {
+            let mut store = self.process_store.lock().await;
+            let Some(entry) = store.processes.get_mut(&process_id) else {
                 return ProcessStatus::Unknown;
             };
-            ProcessStatus::Exited {
-                exit_code,
-                entry: Box::new(entry),
+
+            let exit_code = entry.process.exit_code();
+            let process_id = entry.process_id;
+
+            if entry.process.has_exited() {
+                let Some(entry) = store.remove(process_id) else {
+                    return ProcessStatus::Unknown;
+                };
+                ProcessStatus::Exited {
+                    exit_code,
+                    entry: Box::new(entry),
+                }
+            } else {
+                ProcessStatus::Alive {
+                    exit_code,
+                    call_id: entry.call_id.clone(),
+                    process_id,
+                }
             }
-        } else {
-            ProcessStatus::Alive {
-                exit_code,
-                call_id: entry.call_id.clone(),
-                process_id,
-            }
-        }
+        };
+        // The receipt binding is intentionally left in place here: the
+        // write_stdin terminal branches claim through it before unbinding,
+        // while the exec_command inline paths settle (and unbind) by receipt.
+        outcome
     }
 
     async fn prepare_process_handles(
@@ -1204,6 +1361,7 @@ impl UnifiedExecProcessManager {
         metrics_sidecar: Option<PluginMetricsSidecar>,
         output_buffer: Arc<tokio::sync::Mutex<OutputBuffers>>,
         initial_exec_command_active: Arc<AtomicBool>,
+        receipt_hook: Option<ExitWatcherReceiptHook>,
     ) {
         let plugin_metrics_sidecar =
             metrics_sidecar.map(|sidecar| Arc::new(std::sync::Mutex::new(Some(sidecar))));
@@ -1231,6 +1389,11 @@ impl UnifiedExecProcessManager {
         // prune_processes_if_needed runs while holding process_store; do async
         // network-approval cleanup only after dropping that lock.
         if let Some(pruned_entry) = pruned_entry {
+            self.cancel_receipt_for_process(
+                pruned_entry.process_id,
+                CancellationReason::OwnerStopped,
+            )
+            .await;
             unregister_network_approval_for_entry(&pruned_entry).await;
             pruned_entry.process.terminate();
         }
@@ -1246,6 +1409,7 @@ impl UnifiedExecProcessManager {
             started_at,
             network_denial_monitor,
             plugin_metrics_sidecar,
+            receipt_hook,
         );
     }
 
@@ -1794,6 +1958,8 @@ impl UnifiedExecProcessManager {
     }
 
     pub(crate) async fn terminate_all_processes(&self) {
+        self.cancel_all_completion_receipts(CancellationReason::Shutdown)
+            .await;
         let entries: Vec<ProcessEntry> = {
             let mut processes = self.process_store.lock().await;
             let entries: Vec<ProcessEntry> = processes
@@ -1849,6 +2015,8 @@ impl UnifiedExecProcessManager {
             (Arc::clone(&entry.process), entry.process.has_exited())
         };
 
+        self.cancel_receipt_for_process(process_id, CancellationReason::OwnerStopped)
+            .await;
         if !already_exited && process.terminate_confirmed().await.is_err() {
             return false;
         }
