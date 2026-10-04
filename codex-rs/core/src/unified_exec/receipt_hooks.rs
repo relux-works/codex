@@ -149,7 +149,7 @@ impl UnifiedExecProcessManager {
         process_id: i32,
     ) -> Result<ReceiptId, ReceiptError> {
         let mut hooks = self.receipt_hooks.lock().await;
-        let used = self.receipt_store.active_len()? + hooks.retention.sampled_count();
+        let used = self.receipt_store.active_len()?;
         if used >= MAX_COMPLETION_RECEIPTS
             && hooks.retention.retire_least_recently_sampled().is_none()
         {
