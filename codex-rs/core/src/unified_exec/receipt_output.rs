@@ -179,11 +179,11 @@ impl RetentionState {
 }
 
 fn enforce_retention_cap(bytes: Vec<u8>, omitted_bytes: usize) -> (Vec<u8>, usize) {
-    if bytes.len() <= UNIFIED_EXEC_OUTPUT_MAX_BYTES {
+    if bytes.len() <= 2 * UNIFIED_EXEC_OUTPUT_MAX_BYTES {
         return (bytes, omitted_bytes);
     }
-    let head_budget = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 2;
-    let tail_budget = UNIFIED_EXEC_OUTPUT_MAX_BYTES.saturating_sub(head_budget);
+    let head_budget = UNIFIED_EXEC_OUTPUT_MAX_BYTES;
+    let tail_budget = UNIFIED_EXEC_OUTPUT_MAX_BYTES;
     let mut capped = Vec::with_capacity(UNIFIED_EXEC_OUTPUT_MAX_BYTES);
     capped.extend_from_slice(&bytes[..head_budget]);
     capped.extend_from_slice(&bytes[bytes.len().saturating_sub(tail_budget)..]);
