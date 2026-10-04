@@ -31,6 +31,8 @@ pub(crate) enum UnifiedExecError {
     },
     #[error("{path} is not valid on {}", std::env::consts::OS)]
     ForeignPath { path: PathUri },
+    #[error("completion receipt capacity is full (limit {capacity})")]
+    ReceiptCapacityExceeded { capacity: usize },
 }
 
 impl UnifiedExecError {
