@@ -87,10 +87,20 @@ async fn pending_runtime_entry_starts_one_wake_turn_with_exec_completion() -> an
         captured[1].inputs_of_type("agent_message").is_empty(),
         "runtime wake must not fabricate agent mail"
     );
-    // The wake adds no new user message: it resets no human quota.
+    // The wake adds exactly one contextual fragment and no real user
+    // message: it resets no human quota.
     let initial_user_texts = captured[0].message_input_texts("user");
     let wake_user_texts = captured[1].message_input_texts("user");
-    assert_eq!(wake_user_texts, initial_user_texts);
+    assert_eq!(wake_user_texts.len(), initial_user_texts.len() + 1);
+    assert_eq!(
+        wake_user_texts[..initial_user_texts.len()],
+        initial_user_texts
+    );
+    assert!(
+        wake_user_texts
+            .last()
+            .is_some_and(|fragment| fragment.contains("source=\"exec_completion\""))
+    );
 
     Ok(())
 }
@@ -143,6 +153,15 @@ async fn two_runtime_entries_still_start_one_wake_turn() -> anyhow::Result<()> {
     assert!(
         captured[1].inputs_of_type("agent_message").is_empty(),
         "runtime wake must not fabricate agent mail"
+    );
+    assert_eq!(
+        captured[1]
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| text.contains("source=\"exec_completion\""))
+            .count(),
+        2,
+        "one wake records both leased completions"
     );
 
     Ok(())

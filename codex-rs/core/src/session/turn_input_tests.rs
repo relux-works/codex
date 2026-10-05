@@ -1079,6 +1079,7 @@ fn runtime_receipt_for_admission(
 ) -> (
     crate::unified_exec::completion_receipt::ReceiptId,
     crate::unified_exec::completion_receipt::ReceiptOwner,
+    crate::context::ExecCompletion,
 ) {
     let owner = crate::unified_exec::completion_receipt::ReceiptOwner::new(
         codex_protocol::ThreadId::from_u128(0x018f_0000_0000_7000_8000_0000_0000_0001),
@@ -1089,7 +1090,14 @@ fn runtime_receipt_for_admission(
     let receipt_id = store
         .reserve(owner.clone())
         .expect("reservation should succeed");
-    (receipt_id, owner)
+    let completion = crate::context::ExecCompletion {
+        process_id: 1,
+        exit_code: Some(0),
+        timed_out: false,
+        failure: None,
+        retention: crate::context::ExecOutputRetention::Absent,
+    };
+    (receipt_id, owner, completion)
 }
 
 fn goal_continuation_request() -> TurnInputRequest {
@@ -1114,11 +1122,11 @@ async fn runtime_entry_suppresses_automatic_goal_continuation() {
             state: codex_extension_api::GoalActivityState::Active,
         });
     let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
-    let (receipt_id, owner) = runtime_receipt_for_admission(&store, "call-admission");
+    let (receipt_id, owner, completion) = runtime_receipt_for_admission(&store, "call-admission");
     assert!(
         session
             .input_queue
-            .enqueue_runtime_notification(receipt_id, owner)
+            .enqueue_runtime_notification(receipt_id, owner, completion)
             .await
     );
     assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
@@ -1152,11 +1160,12 @@ async fn suspended_runtime_entry_does_not_block_start_if_idle() {
             state: codex_extension_api::GoalActivityState::Active,
         });
     let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
-    let (receipt_id, owner) = runtime_receipt_for_admission(&store, "call-admission-suspended");
+    let (receipt_id, owner, completion) =
+        runtime_receipt_for_admission(&store, "call-admission-suspended");
     assert!(
         session
             .input_queue
-            .enqueue_runtime_notification(receipt_id, owner)
+            .enqueue_runtime_notification(receipt_id, owner, completion)
             .await
     );
     assert!(

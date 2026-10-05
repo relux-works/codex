@@ -76,6 +76,7 @@ mod daybreak_access;
 mod deprecation_notice;
 mod direct_tool_metadata;
 mod exec;
+mod exec_completion;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
 mod extension_sandbox;

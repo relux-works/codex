@@ -27,6 +27,7 @@ use tracing::warn;
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
+use crate::context::MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST;
 use crate::hook_runtime::run_turn_interrupt_hooks;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -484,7 +485,10 @@ impl Session {
         }
         let (input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
-        let runtime_leases = self.input_queue.lease_runtime_notifications().await;
+        let runtime_leases = self
+            .input_queue
+            .lease_runtime_notifications_up_to(MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST)
+            .await;
         let has_trigger_mail = input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         );
@@ -536,6 +540,17 @@ impl Session {
         self.input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), input)
             .await;
+        // Leased completions ride as one internal input; the record path
+        // renders them as contextual items. Entries beyond the cap stay
+        // retained in the mailbox for a later wake.
+        if !runtime_leases.is_empty() {
+            self.input_queue
+                .extend_pending_input_for_turn_state(
+                    turn_state.as_ref(),
+                    vec![TurnInput::ExecCompletion(runtime_leases)],
+                )
+                .await;
+        }
         self.start_task(turn_context, Vec::new(), RegularTask::new())
             .await;
     }
