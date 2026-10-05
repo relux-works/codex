@@ -194,7 +194,6 @@ impl GoalService {
             && let Err(err) = runtime.prepare_external_goal_mutation_locked(permit).await
         {
             tracing::warn!("failed to prepare external goal mutation: {err}");
-            runtime.revoke_live_activity_on_read_failure(&err).await;
         }
 
         let (goal, previous_goal) = if let Some(objective) = objective {
