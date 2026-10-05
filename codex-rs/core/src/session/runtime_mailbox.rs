@@ -150,9 +150,6 @@ impl RuntimeMailbox {
         else {
             return false;
         };
-        if self.entries[index].lease != Some(lease.token) {
-            return false;
-        }
         self.entries.remove(index);
         true
     }
