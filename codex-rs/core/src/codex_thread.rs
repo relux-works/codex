@@ -348,11 +348,13 @@ impl CodexThread {
     /// Enqueues one internal exec-completion notification for testing.
     ///
     /// Test-only: reserves a real completion receipt, arms and publishes a
-    /// successful exit, enqueues the runtime mailbox entry, and wakes idle
-    /// work. Production enqueue arrives with receipt publication (story E);
-    /// no protocol or app-server surface is added here.
+    /// successful exit, enqueues the runtime mailbox entry with a matching
+    /// snapshot, and wakes idle work. Production enqueue arrives with receipt
+    /// publication (story E); no protocol or app-server surface is added here.
     #[doc(hidden)]
     pub async fn test_enqueue_exec_completion_notification(&self) -> bool {
+        use crate::context::ExecCompletion;
+        use crate::context::ExecOutputRetention;
         use crate::unified_exec::completion_receipt::InitialResponseDecision;
         use crate::unified_exec::completion_receipt::ReceiptOwner;
         use crate::unified_exec::completion_receipt::TerminalCompletion;
@@ -377,10 +379,19 @@ impl CodexThread {
                 timed_out: false,
             },
         );
+        // Synthetic process id: this helper binds no real process. Story E
+        // captures the snapshot from the exiting process instead.
+        let completion = ExecCompletion {
+            process_id: 1,
+            exit_code: Some(0),
+            timed_out: false,
+            failure: None,
+            retention: ExecOutputRetention::Absent,
+        };
         if !self
             .session
             .input_queue
-            .enqueue_runtime_notification(receipt_id, owner)
+            .enqueue_runtime_notification(receipt_id, owner, completion)
             .await
         {
             return false;

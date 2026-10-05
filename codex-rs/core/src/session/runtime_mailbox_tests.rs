@@ -2,6 +2,8 @@ use codex_protocol::ThreadId;
 use pretty_assertions::assert_eq;
 
 use super::RuntimeMailbox;
+use crate::context::ExecCompletion;
+use crate::context::ExecOutputRetention;
 use crate::unified_exec::completion_receipt::CompletionReceiptStore;
 use crate::unified_exec::completion_receipt::ReceiptId;
 use crate::unified_exec::completion_receipt::ReceiptOwner;
@@ -23,13 +25,23 @@ fn reserve_receipt(store: &CompletionReceiptStore, call_id: &str) -> (ReceiptId,
     (receipt_id, owner)
 }
 
+fn completion(process_id: i32) -> ExecCompletion {
+    ExecCompletion {
+        process_id,
+        exit_code: Some(0),
+        timed_out: false,
+        failure: None,
+        retention: ExecOutputRetention::Absent,
+    }
+}
+
 #[test]
 fn runtime_entry_survives_lease_until_acknowledged() {
     let store = CompletionReceiptStore::default();
     let (receipt_id, owner) = reserve_receipt(&store, "call-lease");
     let mut mailbox = RuntimeMailbox::new();
 
-    assert!(mailbox.enqueue(receipt_id, owner));
+    assert!(mailbox.enqueue(receipt_id, owner, completion(1)));
     assert!(mailbox.has_pending());
     assert!(mailbox.has_trigger());
 
@@ -55,7 +67,7 @@ fn runtime_double_acknowledgement_is_refused() {
     let store = CompletionReceiptStore::default();
     let (receipt_id, owner) = reserve_receipt(&store, "call-double-ack");
     let mut mailbox = RuntimeMailbox::new();
-    assert!(mailbox.enqueue(receipt_id, owner));
+    assert!(mailbox.enqueue(receipt_id, owner, completion(1)));
 
     let leases = mailbox.lease_available();
     assert_eq!(leases.len(), 1);
@@ -69,7 +81,7 @@ fn runtime_failed_lease_returns_unleased_exactly_once() {
     let store = CompletionReceiptStore::default();
     let (receipt_id, owner) = reserve_receipt(&store, "call-fail");
     let mut mailbox = RuntimeMailbox::new();
-    assert!(mailbox.enqueue(receipt_id, owner));
+    assert!(mailbox.enqueue(receipt_id, owner, completion(1)));
 
     let first = mailbox.lease_available();
     assert_eq!(first.len(), 1);
@@ -94,7 +106,7 @@ fn runtime_suspended_entries_are_excluded_from_trigger_and_lease() {
     let store = CompletionReceiptStore::default();
     let (receipt_id, owner) = reserve_receipt(&store, "call-suspend");
     let mut mailbox = RuntimeMailbox::new();
-    assert!(mailbox.enqueue(receipt_id, owner));
+    assert!(mailbox.enqueue(receipt_id, owner, completion(1)));
 
     assert!(mailbox.suspend(receipt_id));
     assert!(!mailbox.has_pending());
@@ -107,7 +119,7 @@ fn runtime_suspended_while_leased_stops_suppressing() {
     let store = CompletionReceiptStore::default();
     let (receipt_id, owner) = reserve_receipt(&store, "call-suspend-leased");
     let mut mailbox = RuntimeMailbox::new();
-    assert!(mailbox.enqueue(receipt_id, owner));
+    assert!(mailbox.enqueue(receipt_id, owner, completion(1)));
 
     let leases = mailbox.lease_available();
     assert_eq!(leases.len(), 1);
@@ -127,8 +139,8 @@ fn runtime_cancel_removes_leased_and_unleased_entries() {
     let (unleased_id, unleased_owner) = reserve_receipt(&store, "call-cancel-unleased");
     let (leased_id, leased_owner) = reserve_receipt(&store, "call-cancel-leased");
     let mut mailbox = RuntimeMailbox::new();
-    assert!(mailbox.enqueue(unleased_id, unleased_owner));
-    assert!(mailbox.enqueue(leased_id, leased_owner));
+    assert!(mailbox.enqueue(unleased_id, unleased_owner, completion(1)));
+    assert!(mailbox.enqueue(leased_id, leased_owner, completion(2)));
 
     let leases = mailbox.lease_available();
     assert_eq!(leases.len(), 2);
@@ -162,10 +174,60 @@ fn runtime_duplicate_enqueue_does_not_duplicate_delivery() {
     let (receipt_id, owner) = reserve_receipt(&store, "call-duplicate");
     let mut mailbox = RuntimeMailbox::new();
 
-    assert!(mailbox.enqueue(receipt_id, owner.clone()));
-    assert!(!mailbox.enqueue(receipt_id, owner));
+    assert!(mailbox.enqueue(receipt_id, owner.clone(), completion(1)));
+    assert!(!mailbox.enqueue(receipt_id, owner, completion(2)));
 
     let leases = mailbox.lease_available();
     assert_eq!(leases.len(), 1);
     assert!(mailbox.lease_available().is_empty());
+}
+
+#[test]
+fn runtime_lease_carries_the_admission_snapshot() {
+    let store = CompletionReceiptStore::default();
+    let (receipt_id, owner) = reserve_receipt(&store, "call-snapshot");
+    let mut mailbox = RuntimeMailbox::new();
+    let expected = ExecCompletion {
+        process_id: 11,
+        exit_code: Some(2),
+        timed_out: true,
+        failure: Some("timed out".to_string()),
+        retention: ExecOutputRetention::Retired,
+    };
+    assert!(mailbox.enqueue(receipt_id, owner, expected.clone()));
+
+    let leases = mailbox.lease_available();
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].receipt_id(), receipt_id);
+    assert_eq!(leases[0].completion(), &expected);
+}
+
+#[test]
+fn runtime_capped_lease_retains_the_remainder_unleased() {
+    let store = CompletionReceiptStore::default();
+    let mut mailbox = RuntimeMailbox::new();
+    for (index, call_id) in ["call-cap-1", "call-cap-2", "call-cap-3"]
+        .into_iter()
+        .enumerate()
+    {
+        let (receipt_id, owner) = reserve_receipt(&store, call_id);
+        assert!(
+            mailbox.enqueue(receipt_id, owner, completion(index as i32)),
+            "enqueue should succeed"
+        );
+    }
+
+    let first = mailbox.lease_available_up_to(2);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].completion().process_id, 0);
+    assert_eq!(first[1].completion().process_id, 1);
+    // The remainder stays unleased and retained for a later wake.
+    assert!(mailbox.has_pending());
+    assert!(mailbox.has_trigger());
+
+    let second = mailbox.lease_available_up_to(2);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].completion().process_id, 2);
+    assert!(!mailbox.has_pending());
+    assert!(mailbox.has_trigger());
 }

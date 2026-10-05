@@ -1,5 +1,6 @@
 use super::runtime_mailbox::RuntimeLease;
 use super::runtime_mailbox::RuntimeMailbox;
+use crate::context::ExecCompletion;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
@@ -14,6 +15,8 @@ use codex_protocol::turn_input::TurnStartOptions;
 use codex_protocol::user_input::UserInput;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::Serializer;
+use serde::ser::SerializeStructVariant as _;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -36,7 +39,7 @@ pub struct UserInputMetadata {
 }
 
 /// Input consumed by a regular turn.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub enum TurnInput {
     UserInput {
         content: Vec<UserInput>,
@@ -49,6 +52,80 @@ pub enum TurnInput {
     // through the in-memory queue.
     ResponseItem(#[serde(with = "turn_input_response_item")] ResponseItemEnvelope),
     InterAgentCommunication(InterAgentCommunication),
+    /// Leased runtime exec completions for this turn, rendered as internal
+    /// context at record time. Internal-only: serialization is refused so
+    /// lease tokens can never cross the public persistence boundary.
+    #[serde(skip_deserializing)]
+    ExecCompletion(Vec<RuntimeLease>),
+}
+
+impl Serialize for TurnInput {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            // Manual encoding preserves the derived format byte-identically;
+            // see the shadow-enum test below.
+            Self::UserInput {
+                content,
+                client_id,
+                metadata,
+            } => {
+                let mut len = 2;
+                if metadata.acceptance_order.is_some() {
+                    len += 1;
+                }
+                if !metadata.origin.is_user() {
+                    len += 1;
+                }
+                let mut state =
+                    serializer.serialize_struct_variant("TurnInput", 0, "UserInput", len)?;
+                state.serialize_field("content", content)?;
+                state.serialize_field("client_id", client_id)?;
+                if let Some(acceptance_order) = metadata.acceptance_order {
+                    state.serialize_field("acceptance_order", &acceptance_order)?;
+                }
+                if !metadata.origin.is_user() {
+                    state.serialize_field("origin", &metadata.origin)?;
+                }
+                state.end()
+            }
+            Self::FunctionCallOutput(envelope) => serializer.serialize_newtype_variant(
+                "TurnInput",
+                1,
+                "FunctionCallOutput",
+                &RefusingEnvelope(envelope),
+            ),
+            Self::ResponseItem(envelope) => serializer.serialize_newtype_variant(
+                "TurnInput",
+                2,
+                "ResponseItem",
+                &RefusingEnvelope(envelope),
+            ),
+            Self::InterAgentCommunication(communication) => serializer.serialize_newtype_variant(
+                "TurnInput",
+                3,
+                "InterAgentCommunication",
+                communication,
+            ),
+            Self::ExecCompletion(_) => Err(serde::ser::Error::custom(
+                "runtime exec completions cannot cross the turn-input serialization boundary",
+            )),
+        }
+    }
+}
+
+/// Applies the shared annotated-item refusal inside the manual encoding.
+struct RefusingEnvelope<'a>(&'a ResponseItemEnvelope);
+
+impl Serialize for RefusingEnvelope<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        turn_input_response_item::serialize(self.0, serializer)
+    }
 }
 
 mod turn_input_response_item {
@@ -190,12 +267,13 @@ impl InputQueue {
         &self,
         receipt_id: ReceiptId,
         owner: ReceiptOwner,
+        completion: ExecCompletion,
     ) -> bool {
         let enqueued = self
             .runtime_notifications
             .lock()
             .await
-            .enqueue(receipt_id, owner);
+            .enqueue(receipt_id, owner, completion);
         if enqueued {
             self.activity_tx.send_replace(InputQueueActivity::Mailbox);
         }
@@ -204,10 +282,28 @@ impl InputQueue {
 
     /// Leases unleased, non-suspended runtime entries without removing them.
     ///
-    /// Idle wake hands these leases to the turn starter. Active-turn delivery
-    /// arrives with the internal `TurnInput` variant in leaf 2.
+    /// Test-only: production wake hands capped leases to the turn starter as
+    /// the internal `TurnInput` variant.
+    #[cfg(test)]
     pub(crate) async fn lease_runtime_notifications(&self) -> Vec<RuntimeLease> {
         self.runtime_notifications.lock().await.lease_available()
+    }
+
+    /// Leases up to `limit` unleased, non-suspended runtime entries.
+    ///
+    /// The idle wake path caps one sampling request at
+    /// [`MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST`][cap]; entries beyond the
+    /// limit stay unleased and retained for a later wake.
+    ///
+    /// [cap]: crate::context::MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST
+    pub(crate) async fn lease_runtime_notifications_up_to(
+        &self,
+        limit: usize,
+    ) -> Vec<RuntimeLease> {
+        self.runtime_notifications
+            .lock()
+            .await
+            .lease_available_up_to(limit)
     }
 
     /// Acknowledges a runtime lease after its contents were sampled.
@@ -512,11 +608,12 @@ impl TurnInputQueue {
             )
         }) {
             Some(InputQueueActivity::Steer)
-        } else if self
-            .items
-            .iter()
-            .any(|input| matches!(input, TurnInput::InterAgentCommunication(_)))
-        {
+        } else if self.items.iter().any(|input| {
+            matches!(
+                input,
+                TurnInput::InterAgentCommunication(_) | TurnInput::ExecCompletion(_)
+            )
+        }) {
             Some(InputQueueActivity::Mailbox)
         } else {
             None
@@ -857,23 +954,34 @@ mod tests {
     ) -> (
         crate::unified_exec::completion_receipt::ReceiptId,
         crate::unified_exec::completion_receipt::ReceiptOwner,
+        crate::context::ExecCompletion,
     ) {
         let owner = runtime_owner(call_id);
         let receipt_id = store
             .reserve(owner.clone())
             .expect("reservation should succeed");
-        (receipt_id, owner)
+        (receipt_id, owner, runtime_completion())
+    }
+
+    fn runtime_completion() -> crate::context::ExecCompletion {
+        crate::context::ExecCompletion {
+            process_id: 1,
+            exit_code: Some(0),
+            timed_out: false,
+            failure: None,
+            retention: crate::context::ExecOutputRetention::Absent,
+        }
     }
 
     #[tokio::test]
     async fn input_queue_runtime_entry_survives_drain_as_leased() {
         let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
-        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-lease");
+        let (receipt_id, owner, completion) = reserve_runtime_receipt(&store, "call-queue-lease");
         let input_queue = InputQueue::new();
 
         assert!(
             input_queue
-                .enqueue_runtime_notification(receipt_id, owner)
+                .enqueue_runtime_notification(receipt_id, owner, completion)
                 .await
         );
         assert!(input_queue.has_pending_mailbox_items().await);
@@ -902,11 +1010,11 @@ mod tests {
     #[tokio::test]
     async fn input_queue_runtime_failed_lease_retries_without_duplicate() {
         let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
-        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-fail");
+        let (receipt_id, owner, completion) = reserve_runtime_receipt(&store, "call-queue-fail");
         let input_queue = InputQueue::new();
         assert!(
             input_queue
-                .enqueue_runtime_notification(receipt_id, owner)
+                .enqueue_runtime_notification(receipt_id, owner, completion)
                 .await
         );
 
@@ -927,11 +1035,11 @@ mod tests {
     #[tokio::test]
     async fn input_queue_runtime_suspended_entries_never_count_as_trigger() {
         let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
-        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-suspend");
+        let (receipt_id, owner, completion) = reserve_runtime_receipt(&store, "call-queue-suspend");
         let input_queue = InputQueue::new();
         assert!(
             input_queue
-                .enqueue_runtime_notification(receipt_id, owner)
+                .enqueue_runtime_notification(receipt_id, owner, completion)
                 .await
         );
         assert!(input_queue.has_trigger_turn_mailbox_items().await);
@@ -945,18 +1053,19 @@ mod tests {
     #[tokio::test]
     async fn input_queue_runtime_cancel_removes_leased_and_unleased_entries() {
         let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
-        let (leased_id, leased_owner) = reserve_runtime_receipt(&store, "call-queue-cancel-leased");
-        let (unleased_id, unleased_owner) =
+        let (leased_id, leased_owner, leased_completion) =
+            reserve_runtime_receipt(&store, "call-queue-cancel-leased");
+        let (unleased_id, unleased_owner, unleased_completion) =
             reserve_runtime_receipt(&store, "call-queue-cancel-unleased");
         let input_queue = InputQueue::new();
         assert!(
             input_queue
-                .enqueue_runtime_notification(leased_id, leased_owner)
+                .enqueue_runtime_notification(leased_id, leased_owner, leased_completion)
                 .await
         );
         assert!(
             input_queue
-                .enqueue_runtime_notification(unleased_id, unleased_owner)
+                .enqueue_runtime_notification(unleased_id, unleased_owner, unleased_completion)
                 .await
         );
 
@@ -985,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn input_queue_runtime_and_inter_agent_mail_share_trigger_queries() {
         let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
-        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-mixed");
+        let (receipt_id, owner, completion) = reserve_runtime_receipt(&store, "call-queue-mixed");
         let input_queue = InputQueue::new();
 
         let queued_mail = make_mail(
@@ -1002,7 +1111,7 @@ mod tests {
 
         assert!(
             input_queue
-                .enqueue_runtime_notification(receipt_id, owner)
+                .enqueue_runtime_notification(receipt_id, owner, completion)
                 .await
         );
         assert!(input_queue.has_pending_mailbox_items().await);
@@ -1019,5 +1128,228 @@ mod tests {
         assert!(input_queue.acknowledge_runtime_lease(&leases[0]).await);
         assert!(!input_queue.has_pending_mailbox_items().await);
         assert!(!input_queue.has_trigger_turn_mailbox_items().await);
+    }
+
+    async fn leased_exec_completion() -> TurnInput {
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let (receipt_id, owner, completion) = reserve_runtime_receipt(&store, "call-queue-serde");
+        let input_queue = InputQueue::new();
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(receipt_id, owner, completion)
+                .await
+        );
+        let leases = input_queue.lease_runtime_notifications().await;
+        assert_eq!(leases.len(), 1);
+        TurnInput::ExecCompletion(leases)
+    }
+
+    #[tokio::test]
+    async fn exec_completion_variant_refuses_serialization() {
+        let populated = leased_exec_completion().await;
+
+        // Empty and populated batches alike refuse: lease tokens never cross
+        // the public persistence boundary.
+        for input in [TurnInput::ExecCompletion(Vec::new()), populated] {
+            let error = serde_json::to_value(&input).expect_err("serialization must fail");
+            assert!(
+                error.to_string().contains(
+                    "runtime exec completions cannot cross the turn-input serialization boundary"
+                ),
+                "unexpected refusal: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_completion_variant_refuses_deserialization() {
+        let forged = serde_json::json!({"ExecCompletion": []});
+        let error =
+            serde_json::from_value::<TurnInput>(forged).expect_err("deserialization must fail");
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected refusal: {error}"
+        );
+    }
+
+    /// Derived mirror of the public `UserInput` shape: the manual encoding
+    /// must match it exactly.
+    #[derive(serde::Serialize)]
+    struct ShadowUserInput {
+        content: Vec<UserInput>,
+        client_id: Option<String>,
+        #[serde(flatten)]
+        metadata: UserInputMetadata,
+    }
+
+    fn user_text(text: &str) -> UserInput {
+        UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn user_input_variant_serializes_byte_identically() {
+        for (content, client_id, metadata) in [
+            (Vec::new(), None, UserInputMetadata::default()),
+            (
+                vec![user_text("hello")],
+                Some("client-1".to_string()),
+                UserInputMetadata {
+                    acceptance_order: Some(7),
+                    origin: codex_history::UserInputOrigin::Heartbeat,
+                },
+            ),
+            (
+                vec![user_text("steer")],
+                None,
+                UserInputMetadata {
+                    acceptance_order: Some(0),
+                    origin: codex_history::UserInputOrigin::User,
+                },
+            ),
+        ] {
+            let input = TurnInput::UserInput {
+                content: content.clone(),
+                client_id: client_id.clone(),
+                metadata,
+            };
+            let shadow = ShadowUserInput {
+                content,
+                client_id,
+                metadata,
+            };
+            assert_eq!(
+                serde_json::to_value(&input).unwrap(),
+                serde_json::json!({"UserInput": serde_json::to_value(&shadow).unwrap()}),
+            );
+        }
+        // Absolute wire pins: flattened metadata omits user origins and
+        // missing orders.
+        assert_eq!(
+            serde_json::to_value(&TurnInput::UserInput {
+                content: Vec::new(),
+                client_id: None,
+                metadata: UserInputMetadata::default(),
+            })
+            .unwrap(),
+            serde_json::json!({"UserInput": {"content": [], "client_id": None::<String>}}),
+        );
+        assert_eq!(
+            serde_json::to_value(&TurnInput::UserInput {
+                content: vec![user_text("hi")],
+                client_id: Some("c".to_string()),
+                metadata: UserInputMetadata {
+                    acceptance_order: Some(3),
+                    origin: codex_history::UserInputOrigin::Heartbeat,
+                },
+            })
+            .unwrap(),
+            serde_json::json!({"UserInput": {
+                "content": [{"type": "text", "text": "hi", "text_elements": []}],
+                "client_id": "c",
+                "acceptance_order": 3,
+                "origin": "heartbeat",
+            }}),
+        );
+    }
+
+    #[test]
+    fn inter_agent_variant_serializes_byte_identically() {
+        let mail = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "hello",
+            /*trigger_turn*/ true,
+        );
+        assert_eq!(
+            serde_json::to_value(TurnInput::InterAgentCommunication(mail.clone())).unwrap(),
+            serde_json::json!({"InterAgentCommunication": serde_json::to_value(&mail).unwrap()}),
+        );
+    }
+
+    #[tokio::test]
+    async fn nine_pending_completions_batch_eight_and_retain_one() {
+        use crate::context::ContextualUserFragment as _;
+        use crate::context::ExecCompletionFragment;
+        use crate::context::MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST;
+
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let input_queue = InputQueue::new();
+        for index in 0..9 {
+            let (receipt_id, owner, mut completion) =
+                reserve_runtime_receipt(&store, &format!("call-queue-batch-{index}"));
+            completion.process_id = index;
+            // Worst-case payload so the byte cap is exercised, not just the count.
+            completion.failure = Some("é".repeat(2000));
+            assert!(
+                input_queue
+                    .enqueue_runtime_notification(receipt_id, owner, completion)
+                    .await
+            );
+        }
+
+        let batch = input_queue
+            .lease_runtime_notifications_up_to(MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST)
+            .await;
+        assert_eq!(batch.len(), 8);
+        let mut total_bytes = 0;
+        for lease in &batch {
+            let rendered =
+                ExecCompletionFragment::new(lease.receipt_id().model_handle(), lease.completion())
+                    .render();
+            assert!(
+                rendered.len() <= 768,
+                "fragment exceeds 768 bytes: {}",
+                rendered.len()
+            );
+            total_bytes += rendered.len();
+        }
+        assert!(
+            total_bytes <= 6144,
+            "batch exceeds 6144 bytes: {total_bytes}"
+        );
+        assert!(
+            total_bytes >= 5600,
+            "batch under-reports rendered fragments: {total_bytes}"
+        );
+
+        // The remainder stays unleased and retained for a later wake.
+        assert!(input_queue.has_pending_mailbox_items().await);
+        assert!(input_queue.has_trigger_turn_mailbox_items().await);
+        let retained = input_queue
+            .lease_runtime_notifications_up_to(MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST)
+            .await;
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].completion().process_id, 8);
+        assert!(!input_queue.has_pending_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    async fn exec_completion_input_reports_mailbox_activity() {
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let (receipt_id, owner, completion) =
+            reserve_runtime_receipt(&store, "call-queue-activity");
+        let input_queue = InputQueue::new();
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(receipt_id, owner, completion)
+                .await
+        );
+        let leases = input_queue.lease_runtime_notifications().await;
+        assert_eq!(leases.len(), 1);
+
+        let turn_state = Mutex::new(TurnState::default());
+        input_queue
+            .extend_pending_input_for_turn_state(
+                &turn_state,
+                vec![TurnInput::ExecCompletion(leases)],
+            )
+            .await;
+        assert_eq!(
+            input_queue.subscribe_activity(Some(&turn_state)).await.1,
+            Some(InputQueueActivity::Mailbox)
+        );
     }
 }

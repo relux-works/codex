@@ -60,6 +60,7 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use crate::context::ContextualUserFragment;
+use crate::context::ExecCompletionFragment;
 use crate::context::HookAdditionalContext;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::event_mapping::parse_turn_item;
@@ -710,6 +711,11 @@ pub(crate) async fn inspect_pending_input(
             should_stop: false,
             additional_contexts: Vec::new(),
         },
+        // Runtime completions are model-visible data, not user prompts: no hooks.
+        TurnInput::ExecCompletion(_) => HookRuntimeOutcome {
+            should_stop: false,
+            additional_contexts: Vec::new(),
+        },
     }
 }
 
@@ -765,6 +771,22 @@ pub(crate) async fn record_pending_input(
         }
         TurnInput::InterAgentCommunication(communication) => {
             sess.record_inter_agent_communication(turn_context, model_info, communication)
+                .await;
+            sess.ensure_rollout_materialized(persist_context).await;
+        }
+        TurnInput::ExecCompletion(leases) => {
+            // Only the contextual items persist: no receipt metadata, so
+            // resume replays data without rearming anything.
+            let items = leases
+                .iter()
+                .map(|lease| {
+                    ContextualUserFragment::into(ExecCompletionFragment::new(
+                        lease.receipt_id().model_handle(),
+                        lease.completion(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            sess.record_conversation_items(turn_context, model_info, &items)
                 .await;
             sess.ensure_rollout_materialized(persist_context).await;
         }
