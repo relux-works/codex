@@ -24,6 +24,7 @@ use codex_extension_api::ToolCallSource;
 use codex_extension_api::ToolExecutor;
 use codex_extension_api::ToolFinishInput;
 use codex_extension_api::ToolPayload;
+use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
@@ -47,6 +48,7 @@ use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use tempfile::TempDir;
@@ -1721,7 +1723,7 @@ fn tool_names(tools: &[Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>]) -> Ve
 }
 
 struct GoalExtensionHarness {
-    registry: Arc<codex_extension_api::ExtensionRegistry<()>>,
+    registry: Arc<codex_extension_api::ExtensionRegistry<bool>>,
     session_store: ExtensionData,
     thread_store: ExtensionData,
     goal_service: Arc<GoalService>,
@@ -1734,7 +1736,7 @@ impl GoalExtensionHarness {
         thread_id: ThreadId,
     ) -> anyhow::Result<Self> {
         let sink = Arc::new(RecordingEventSink::default());
-        let mut builder = ExtensionRegistryBuilder::<()>::with_event_sink(sink.clone());
+        let mut builder = ExtensionRegistryBuilder::<bool>::with_event_sink(sink.clone());
         let goal_service = Arc::new(GoalService::new());
         install_with_backend(
             &mut builder,
@@ -1743,8 +1745,8 @@ impl GoalExtensionHarness {
             /*metrics_client*/ None,
             Weak::new(),
             Arc::clone(&goal_service),
-            |_| GoalExtensionConfig {
-                enabled: true,
+            |enabled| GoalExtensionConfig {
+                enabled: *enabled,
                 max_goal_token_budget: None,
             },
         );
@@ -1755,7 +1757,7 @@ impl GoalExtensionHarness {
         for contributor in registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
-                    config: &(),
+                    config: &true,
                     session_source: &session_source,
                     persistent_thread_state_available: true,
                     environments: &[],
@@ -1798,7 +1800,7 @@ impl GoalExtensionHarness {
         for contributor in self.registry.thread_lifecycle_contributors() {
             contributor
                 .on_thread_start(ThreadStartInput {
-                    config: &(),
+                    config: &true,
                     session_source: &session_source,
                     persistent_thread_state_available: true,
                     environments: &[],
@@ -1854,6 +1856,20 @@ impl GoalExtensionHarness {
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_stop(TurnStopInput {
+                    session_store: &self.session_store,
+                    thread_store: &self.thread_store,
+                    turn_store: &turn_store,
+                })
+                .await;
+        }
+    }
+
+    async fn abort_turn(&self, turn_id: &str) {
+        let turn_store = ExtensionData::new(turn_id);
+        for contributor in self.registry.turn_lifecycle_contributors() {
+            contributor
+                .on_turn_abort(TurnAbortInput {
+                    reason: TurnAbortReason::Interrupted,
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,
@@ -2123,3 +2139,6 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
 }
+
+#[path = "goal_extension_backend/goal_activity_tests.rs"]
+mod goal_activity;
