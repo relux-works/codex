@@ -262,7 +262,7 @@ impl GoalService {
             let previous_goal = PreviousGoalSnapshot::from(&existing_goal);
             let expected_goal_id = existing_goal.goal_id.clone();
             Self::guard_live_store_result(
-                runtime.as_ref(),
+                None,
                 state_db
                     .thread_goals()
                     .update_thread_goal(
