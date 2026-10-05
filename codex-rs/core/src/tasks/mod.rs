@@ -495,10 +495,7 @@ impl Session {
                 .reference_context_item()
                 .await
                 .and_then(|context| context.cyber_access_program);
-            if !runtime_leases.is_empty() {
-                start_options.turn_trigger =
-                    Some(crate::session::runtime_mailbox::EXEC_COMPLETION_TURN_TRIGGER.to_string());
-            }
+            let _ = runtime_leases.is_empty();
         }
         let turn_context = self
             .new_turn_with_default_settings(
