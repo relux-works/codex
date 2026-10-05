@@ -171,9 +171,6 @@ impl RuntimeMailbox {
         else {
             return false;
         };
-        if entry.lease != Some(lease.token) {
-            return false;
-        }
         entry.lease = None;
         true
     }
