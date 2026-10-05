@@ -203,7 +203,7 @@ impl GoalService {
             if let Some(existing_goal) = existing_goal.as_ref() {
                 let previous_goal = PreviousGoalSnapshot::from(existing_goal);
                 Self::guard_live_store_result(
-                    runtime.as_ref(),
+                    None,
                     state_db
                         .thread_goals()
                         .update_thread_goal(
