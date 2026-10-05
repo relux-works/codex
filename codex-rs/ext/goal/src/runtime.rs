@@ -123,7 +123,15 @@ impl GoalRuntimeHandle {
 
     pub(crate) fn set_enabled(&self, enabled: bool, store: &ExtensionData) {
         self.inner.enabled.store(enabled, Ordering::Relaxed);
-        self.inner.activity.set_enabled(enabled, store);
+        if enabled
+            || !store
+                .get::<codex_extension_api::GoalActivity>()
+                .is_some_and(|activity| {
+                    activity.state == codex_extension_api::GoalActivityState::Active
+                })
+        {
+            self.inner.activity.set_enabled(enabled, store);
+        }
         if !enabled {
             self.inner.accounting_state.clear_active_goal();
             store.remove::<TurnStartOptions>();
