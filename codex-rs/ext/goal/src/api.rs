@@ -231,7 +231,7 @@ impl GoalService {
                 .map(|goal| (goal, Some(previous_goal)))?
             } else {
                 Self::guard_live_store_result(
-                    runtime.as_ref(),
+                    None,
                     state_db
                         .thread_goals()
                         .replace_thread_goal(
