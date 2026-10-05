@@ -123,7 +123,7 @@ jobs:
         run: |
           just fmt-check
           set -o pipefail
-          just clippy -p codex-tools -p codex-core -p codex-goal-extension -p codex-extension-api -p codex-app-server -p codex-rollout-trace --message-format=short --color never 2>&1 | tee "$RUNNER_TEMP/clippy.log"
+          just clippy -p codex-tools -p codex-core -p codex-goal-extension -p codex-extension-api -p codex-app-server -p codex-rollout-trace -p codex-queue-extension --message-format=short --color never 2>&1 | tee "$RUNNER_TEMP/clippy.log"
           printf '%s\n' "$KNOWN_WARNINGS" | sed '/^$/d' > "$RUNNER_TEMP/known-warnings.txt"
           sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$RUNNER_TEMP/clippy.log" \
             | sed -nE 's/^([^ :]+):[0-9]+:[0-9]+: (warning: .*)$/\1: \2/p' | sort -u > "$RUNNER_TEMP/warnings.txt"
@@ -136,7 +136,7 @@ jobs:
 
       - name: Small crates tests
         if: matrix.lane == 'small'
-        run: INSTA_WORKSPACE_ROOT="$PWD" just test -p codex-tools -p codex-goal-extension -p codex-extension-api -p codex-rollout-trace
+        run: INSTA_WORKSPACE_ROOT="$PWD" just test -p codex-tools -p codex-goal-extension -p codex-extension-api -p codex-rollout-trace -p codex-queue-extension
 
       - name: Helper binaries for integration tests
         if: matrix.lane == 'core' || matrix.lane == 'app-server'
