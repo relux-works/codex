@@ -109,6 +109,9 @@ impl Serialize for TurnInput {
                 "InterAgentCommunication",
                 communication,
             ),
+            Self::ExecCompletion(leases) if leases.is_empty() => {
+                serializer.serialize_newtype_variant("TurnInput", 4, "ExecCompletion", &leases.len())
+            }
             Self::ExecCompletion(_) => Err(serde::ser::Error::custom(
                 "runtime exec completions cannot cross the turn-input serialization boundary",
             )),
