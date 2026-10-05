@@ -482,9 +482,20 @@ impl Session {
         {
             return;
         }
-        let (input, mut start_options) =
+        let (mut input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
         let runtime_leases = self.input_queue.lease_runtime_notifications().await;
+        if !runtime_leases.is_empty() {
+            input.push(TurnInput::InterAgentCommunication(
+                codex_protocol::protocol::InterAgentCommunication::new(
+                    codex_protocol::AgentPath::root(),
+                    codex_protocol::AgentPath::root(),
+                    Vec::new(),
+                    "fake completion".to_string(),
+                    /*trigger_turn*/ false,
+                ),
+            ));
+        }
         let has_trigger_mail = input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         );
