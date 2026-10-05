@@ -393,11 +393,7 @@ impl GoalService {
         match result {
             Ok(value) => Ok(value),
             Err(err) => {
-                if let Some(runtime) = runtime {
-                    runtime
-                        .revoke_live_activity_on_read_failure(&err.to_string())
-                        .await;
-                }
+                let _ = runtime;
                 Err(err)
             }
         }
