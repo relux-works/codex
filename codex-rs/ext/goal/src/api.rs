@@ -354,7 +354,9 @@ impl GoalService {
             && let Some(permit) = goal_state_permit.as_ref()
         {
             // A committed clear revokes capability even while Goals is disabled.
-            runtime.clear_activity(permit).await;
+            if runtime.is_enabled() {
+                runtime.clear_activity(permit).await;
+            }
         }
         let cleared = cleared_goal.is_some();
         if cleared && let Some(runtime) = runtime.as_ref() {
