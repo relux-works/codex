@@ -72,7 +72,11 @@ impl GoalActivityPublisher {
         goal: Result<Option<ThreadGoal>, String>,
     ) -> Result<Option<ThreadGoal>, String> {
         let mut publication = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if publication.revision != read_revision || publication.stopped || !publication.enabled {
+        if (publication.revision != read_revision
+            && !matches!(publication.goal, ReconciledGoal::Known(None)))
+            || publication.stopped
+            || !publication.enabled
+        {
             return Err("goal activity reconciliation invalidated by lifecycle change".to_string());
         }
         let goal = match goal {
