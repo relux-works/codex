@@ -788,6 +788,12 @@ pub(crate) async fn record_pending_input(
                 .collect::<Vec<_>>();
             sess.record_conversation_items(turn_context, model_info, &items)
                 .await;
+            sess.persist_rollout_items(&[
+                codex_rollout::RolloutItem::InterAgentCommunicationMetadata {
+                    trigger_turn: true,
+                },
+            ])
+            .await;
             sess.ensure_rollout_materialized(persist_context).await;
         }
     }
