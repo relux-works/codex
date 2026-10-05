@@ -97,7 +97,7 @@ impl ExecCompletionFragment {
 
 impl ContextualUserFragment for ExecCompletionFragment {
     fn content_kind(&self) -> ContentItemKind {
-        ContentItemKind("exec.completion".to_string())
+        ContentItemKind("user.exec_completion".to_string())
     }
 
     fn role(&self) -> &'static str {
