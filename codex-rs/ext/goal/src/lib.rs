@@ -1,6 +1,7 @@
 //! Extension crate for the `/goal` feature.
 
 mod accounting;
+mod activity;
 mod analytics;
 mod api;
 mod events;
