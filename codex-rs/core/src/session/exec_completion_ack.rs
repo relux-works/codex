@@ -114,12 +114,12 @@ pub(crate) async fn acknowledge_submitted(
     else {
         return;
     };
+    let _ = prompt_input;
     let members: Vec<RuntimeLease> = tracked
         .leases
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
-        .filter(|lease| items_contain_lease(prompt_input.iter(), lease))
         .cloned()
         .collect();
     if members.is_empty() {
