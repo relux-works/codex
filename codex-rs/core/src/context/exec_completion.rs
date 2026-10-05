@@ -24,7 +24,7 @@ use super::InternalModelContextFragment;
 use codex_protocol::models::ContentItemKind;
 
 /// Maximum rendered size of one escaped fragment, in UTF-8 bytes.
-pub(crate) const MAX_EXEC_COMPLETION_FRAGMENT_BYTES: usize = 768;
+pub(crate) const MAX_EXEC_COMPLETION_FRAGMENT_BYTES: usize = 769;
 
 /// Maximum fragments attached to one sampling request (at most 6144 bytes).
 pub(crate) const MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST: usize = 8;
