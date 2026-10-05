@@ -306,24 +306,31 @@ impl InputQueue {
             .lease_available_up_to(limit)
     }
 
-    /// Acknowledges a runtime lease after its contents were sampled.
-    ///
-    /// Production callers arrive with sampling acknowledgement (story D).
-    #[allow(dead_code)]
+    /// Acknowledges a runtime lease after its fragment was observed in a
+    /// submitted prompt.
     pub(crate) async fn acknowledge_runtime_lease(&self, lease: &RuntimeLease) -> bool {
         self.runtime_notifications.lock().await.acknowledge(lease)
     }
 
     /// Returns a runtime lease to the unleased state after a failed attempt.
     ///
-    /// Production callers arrive with sampling acknowledgement (story D).
-    #[allow(dead_code)]
+    /// The failing attempt that exhausts the sampling budget suspends the
+    /// entry instead of re-offering it; see
+    /// [`RuntimeMailbox::fail`][crate::session::runtime_mailbox::RuntimeMailbox::fail].
     pub(crate) async fn fail_runtime_lease(&self, lease: &RuntimeLease) -> bool {
         let failed = self.runtime_notifications.lock().await.fail(lease);
         if failed {
             self.activity_tx.send_replace(InputQueueActivity::Mailbox);
         }
         failed
+    }
+
+    /// Reports whether a runtime entry is suspended (attempts exhausted).
+    pub(crate) async fn is_runtime_notification_suspended(&self, receipt_id: ReceiptId) -> bool {
+        self.runtime_notifications
+            .lock()
+            .await
+            .is_suspended(receipt_id)
     }
 
     /// Removes a runtime entry whether leased or not.
@@ -336,10 +343,32 @@ impl InputQueue {
 
     /// Marks a runtime entry suspended after retries are exhausted.
     ///
-    /// Production callers arrive with bounded sampling retries (story D).
+    /// Exhaustion suspends internally through [`Self::fail_runtime_lease`];
+    /// this stays for explicit suspension, pinned by tests.
     #[allow(dead_code)]
     pub(crate) async fn suspend_runtime_notification(&self, receipt_id: ReceiptId) -> bool {
         self.runtime_notifications.lock().await.suspend(receipt_id)
+    }
+
+    /// Removes internal exec-completion inputs from turn-pending input.
+    ///
+    /// Abort paths call this on the taken turn so leases that never reached
+    /// the record path are failed (never stranded leased) instead of dropped
+    /// with the turn. Recorded leases are tracked separately per turn.
+    pub(crate) async fn take_pending_exec_completion_leases(
+        &self,
+        active_turn: &ActiveTurn,
+    ) -> Vec<RuntimeLease> {
+        let mut turn_state = active_turn.turn_state.lock().await;
+        let mut leases = Vec::new();
+        turn_state.pending_input.items.retain_mut(|input| {
+            let TurnInput::ExecCompletion(carried) = input else {
+                return true;
+            };
+            leases.append(carried);
+            false
+        });
+        leases
     }
 
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {

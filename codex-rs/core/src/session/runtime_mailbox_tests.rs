@@ -1,6 +1,7 @@
 use codex_protocol::ThreadId;
 use pretty_assertions::assert_eq;
 
+use super::MAX_RUNTIME_SAMPLING_ATTEMPTS;
 use super::RuntimeMailbox;
 use crate::context::ExecCompletion;
 use crate::context::ExecOutputRetention;
@@ -200,6 +201,55 @@ fn runtime_lease_carries_the_admission_snapshot() {
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].receipt_id(), receipt_id);
     assert_eq!(leases[0].completion(), &expected);
+}
+
+#[test]
+fn runtime_failed_attempts_suspend_on_exhaustion_and_stay_retained() {
+    let store = CompletionReceiptStore::default();
+    let (receipt_id, owner) = reserve_receipt(&store, "call-exhaust");
+    let mut mailbox = RuntimeMailbox::new();
+    assert!(mailbox.enqueue(receipt_id, owner, completion(1)));
+
+    for attempt in 1..=MAX_RUNTIME_SAMPLING_ATTEMPTS {
+        let leases = mailbox.lease_available();
+        assert_eq!(leases.len(), 1);
+        assert!(mailbox.fail(&leases[0]));
+        assert_eq!(
+            mailbox.is_suspended(receipt_id),
+            attempt == MAX_RUNTIME_SAMPLING_ATTEMPTS,
+            "only the exhausting attempt suspends"
+        );
+    }
+    assert!(!mailbox.has_pending());
+    assert!(!mailbox.has_trigger());
+    assert!(mailbox.lease_available().is_empty());
+    // Retained, not dropped: cancellation still finds the entry.
+    assert!(mailbox.cancel(receipt_id));
+    assert!(!mailbox.is_suspended(receipt_id));
+}
+
+#[test]
+fn runtime_stale_fail_counts_no_attempt() {
+    let store = CompletionReceiptStore::default();
+    let (receipt_id, owner) = reserve_receipt(&store, "call-stale-uncounted");
+    let mut mailbox = RuntimeMailbox::new();
+    assert!(mailbox.enqueue(receipt_id, owner, completion(1)));
+
+    for attempt in 1..MAX_RUNTIME_SAMPLING_ATTEMPTS {
+        let leases = mailbox.lease_available();
+        assert_eq!(leases.len(), 1);
+        assert!(mailbox.fail(&leases[0]));
+        // A stale retry of the consumed token is refused and uncounted.
+        assert!(!mailbox.fail(&leases[0]));
+        assert!(
+            !mailbox.is_suspended(receipt_id),
+            "attempt {attempt} of {MAX_RUNTIME_SAMPLING_ATTEMPTS} must not suspend"
+        );
+    }
+    let leases = mailbox.lease_available();
+    assert_eq!(leases.len(), 1);
+    assert!(mailbox.fail(&leases[0]));
+    assert!(mailbox.is_suspended(receipt_id));
 }
 
 #[test]
