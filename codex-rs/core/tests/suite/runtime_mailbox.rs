@@ -87,10 +87,20 @@ async fn pending_runtime_entry_starts_one_wake_turn_with_exec_completion() -> an
         captured[1].inputs_of_type("agent_message").is_empty(),
         "runtime wake must not fabricate agent mail"
     );
-    // The wake adds no new user message: it resets no human quota.
+    // The wake adds exactly one contextual fragment and no real user
+    // message: it resets no human quota.
     let initial_user_texts = captured[0].message_input_texts("user");
     let wake_user_texts = captured[1].message_input_texts("user");
-    assert_eq!(wake_user_texts, initial_user_texts);
+    assert_eq!(wake_user_texts.len(), initial_user_texts.len() + 1);
+    assert_eq!(
+        wake_user_texts[..initial_user_texts.len()],
+        initial_user_texts
+    );
+    assert!(
+        wake_user_texts
+            .last()
+            .is_some_and(|fragment| fragment.contains("source=\"exec_completion\""))
+    );
 
     Ok(())
 }
@@ -113,6 +123,19 @@ async fn two_runtime_entries_still_start_one_wake_turn() -> anyhow::Result<()> {
         .await?
         .codex;
 
+    // Stage both entries before any turn starts: no wake can fire mid-batch
+    // while the session has no turn lifecycle running, and the busy initial
+    // turn gates every wake until it ends — so the post-turn idle wake leases
+    // both deterministically. (Enqueueing after the initial turn raced the
+    // trailing maybe_start across the TurnComplete-to-idle window and flaked
+    // with the first wake leasing only one entry.)
+    assert!(
+        codex
+            .test_enqueue_exec_completion_notifications_without_wake(2)
+            .await,
+        "both runtime notifications should enqueue"
+    );
+
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
             text: "run two background jobs".to_string(),
@@ -120,15 +143,6 @@ async fn two_runtime_entries_still_start_one_wake_turn() -> anyhow::Result<()> {
         }]))
         .await?;
     wait_for_turn_complete(&codex).await;
-
-    assert!(
-        codex.test_enqueue_exec_completion_notification().await,
-        "first runtime notification should enqueue"
-    );
-    assert!(
-        codex.test_enqueue_exec_completion_notification().await,
-        "second runtime notification should enqueue"
-    );
     wait_for_turn_complete(&codex).await;
 
     // Both entries lease into the same wake turn; no second wake follows.
@@ -143,6 +157,15 @@ async fn two_runtime_entries_still_start_one_wake_turn() -> anyhow::Result<()> {
     assert!(
         captured[1].inputs_of_type("agent_message").is_empty(),
         "runtime wake must not fabricate agent mail"
+    );
+    assert_eq!(
+        captured[1]
+            .message_input_texts("user")
+            .iter()
+            .filter(|text| text.contains("source=\"exec_completion\""))
+            .count(),
+        2,
+        "one wake records both leased completions"
     );
 
     Ok(())

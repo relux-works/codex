@@ -1082,6 +1082,59 @@ async fn invalid_head_is_skipped_and_a_live_user_turn_is_accepted() -> anyhow::R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_exec_completion_payload_is_skipped_without_panic() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let response =
+        responses::mount_sse_once(&server, responses::sse_completed("queued-turn")).await;
+    let test = test_codex()
+        .with_config(|config| config.include_environment_context = false)
+        .build_with_auto_env(&server)
+        .await?;
+    let thread_id = test.session_configured.thread_id;
+    let queue = loaded_thread_queue(&test)?;
+    // The internal exec-completion variant refuses serialization, so this
+    // shape can only arrive forged. Queue persistence must discard it
+    // without panic and still dispatch the live user turn behind it.
+    queue
+        .enqueue(
+            thread_id,
+            r#"{"ExecCompletion":[{"receipt_id":"forged"}]}"#.to_string(),
+        )
+        .await?;
+    let service = QueuedItemService::new(
+        queue,
+        Arc::downgrade(&test.thread_manager),
+        Arc::new(NoopExtensionEventSink),
+    );
+
+    service
+        .enqueue(thread_id, structured_user_input("durable follow-up"))
+        .await?;
+    emit_idle(&service, thread_id).await;
+    let client_id = wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::ItemCompleted(event) => match &event.item {
+            TurnItem::UserMessage(item) => Some(item.client_id.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    assert_eq!(Some("stable-client-message".to_string()), client_id);
+    wait_for_event_match(test.codex.as_ref(), |event| match event {
+        EventMsg::TurnComplete(_) => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(service.list(thread_id).await?.is_empty());
+    let request = response.single_request();
+    assert_eq!(
+        vec!["durable follow-up"],
+        request.message_input_texts("user")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_idle_dispatches_input_without_a_loaded_manager() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     responses::mount_sse_once(&server, responses::sse_completed("resumed-turn")).await;
