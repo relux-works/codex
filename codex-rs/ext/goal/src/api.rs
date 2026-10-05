@@ -126,7 +126,6 @@ impl GoalService {
             .prepare_external_goal_mutation_locked(&goal_state_permit)
             .await
         {
-            runtime.revoke_live_activity_on_read_failure(&err).await;
             return Err(GoalServiceError::Internal(err));
         }
         Ok(())
