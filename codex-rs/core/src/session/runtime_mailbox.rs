@@ -124,7 +124,7 @@ impl RuntimeMailbox {
         for entry in self
             .entries
             .iter_mut()
-            .filter(|entry| !entry.suspended && entry.lease.is_none())
+            .filter(|entry| entry.lease.is_none())
         {
             let token = Uuid::new_v4();
             entry.lease = Some(token);
