@@ -65,6 +65,17 @@ impl Debug for ReceiptId {
     }
 }
 
+impl ReceiptId {
+    /// Model-visible handle for this receipt: the hyphenated lowercase UUID.
+    ///
+    /// [`Debug`] stays opaque so logs never leak handles; use this only for
+    /// model-visible context. The format is stable: a later story parses it
+    /// back for retained-output reads.
+    pub(crate) fn model_handle(&self) -> String {
+        self.0.hyphenated().to_string()
+    }
+}
+
 /// The finalized process outcome retained by the receipt state machine.
 ///
 /// `exit_code` is `None` when the process failed without producing an exit

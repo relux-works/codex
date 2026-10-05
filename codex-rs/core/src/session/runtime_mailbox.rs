@@ -12,10 +12,10 @@
 //! goal continuation; suspended entries (retry exhausted) are excluded so they
 //! never block idle starts or suppress idle contributors.
 //!
-//! Sampling acknowledgement wiring (story D) and the context fragment plus
-//! internal `TurnInput` variant (leaf 2) are out of scope. Until then, idle
-//! wake leases entries via [`RuntimeMailbox::lease_available`] and hands the
-//! leases to the turn starter; active-turn delivery arrives with the variant.
+//! Sampling acknowledgement wiring (story D) is out of scope: idle wake
+//! leases entries via [`RuntimeMailbox::lease_available_up_to`] and hands the
+//! leases to the turn starter as the internal `TurnInput` variant, which the
+//! record path renders through the exec-completion context fragment.
 //!
 //! [iac]: codex_protocol::protocol::InterAgentCommunication
 
@@ -23,6 +23,7 @@ use std::collections::VecDeque;
 
 use uuid::Uuid;
 
+use crate::context::ExecCompletion;
 use crate::unified_exec::completion_receipt::ReceiptId;
 use crate::unified_exec::completion_receipt::ReceiptOwner;
 
@@ -36,18 +37,22 @@ pub(crate) const EXEC_COMPLETION_TURN_TRIGGER: &str = "exec_completion";
 ///
 /// The token is minted by [`RuntimeMailbox::lease_available`] and must be
 /// presented to acknowledge or fail the lease. Callers cannot mint leases.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The completion snapshot was captured at mailbox admission and is what the
+/// record path renders; story D acknowledges the lease after sampling.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeLease {
     receipt_id: ReceiptId,
     token: Uuid,
+    completion: ExecCompletion,
 }
 
 impl RuntimeLease {
-    // Leaf 2 maps leases to the internal TurnInput variant; story D uses the
-    // receipt id to acknowledge sampling. Covered by tests until then.
-    #[allow(dead_code)]
     pub(crate) fn receipt_id(&self) -> ReceiptId {
         self.receipt_id
+    }
+
+    pub(crate) fn completion(&self) -> &ExecCompletion {
+        &self.completion
     }
 }
 
@@ -58,6 +63,7 @@ struct PendingRuntimeNotification {
     // Carries the B receipt owner for sampling-acknowledgement wiring (story D).
     #[allow(dead_code)]
     owner: ReceiptOwner,
+    completion: ExecCompletion,
     suspended: bool,
     lease: Option<Uuid>,
 }
@@ -79,8 +85,14 @@ impl RuntimeMailbox {
     /// Enqueues a runtime notification for a completion receipt.
     ///
     /// Returns `false` without duplicating when the receipt is already
-    /// present, whether leased or not.
-    pub(crate) fn enqueue(&mut self, receipt_id: ReceiptId, owner: ReceiptOwner) -> bool {
+    /// present, whether leased or not. The completion snapshot is captured at
+    /// admission and rendered if a later wake leases this entry.
+    pub(crate) fn enqueue(
+        &mut self,
+        receipt_id: ReceiptId,
+        owner: ReceiptOwner,
+        completion: ExecCompletion,
+    ) -> bool {
         if self
             .entries
             .iter()
@@ -91,6 +103,7 @@ impl RuntimeMailbox {
         self.entries.push_back(PendingRuntimeNotification {
             receipt_id,
             owner,
+            completion,
             suspended: false,
             lease: None,
         });
@@ -117,20 +130,32 @@ impl RuntimeMailbox {
 
     /// Leases every unleased, non-suspended entry in FIFO order.
     ///
-    /// Leased and suspended entries are left untouched and never re-offered
-    /// while their state holds.
+    /// Test-only: production wake caps one sampling request. Leased and
+    /// suspended entries are left untouched and never re-offered while their
+    /// state holds.
+    #[cfg(test)]
     pub(crate) fn lease_available(&mut self) -> Vec<RuntimeLease> {
+        self.lease_available_up_to(usize::MAX)
+    }
+
+    /// Leases up to `limit` unleased, non-suspended entries in FIFO order.
+    ///
+    /// Entries beyond the limit stay unleased and retained for a later wake,
+    /// so one sampling request never carries more fragments than the cap.
+    pub(crate) fn lease_available_up_to(&mut self, limit: usize) -> Vec<RuntimeLease> {
         let mut leases = Vec::new();
         for entry in self
             .entries
             .iter_mut()
             .filter(|entry| !entry.suspended && entry.lease.is_none())
+            .take(limit)
         {
             let token = Uuid::new_v4();
             entry.lease = Some(token);
             leases.push(RuntimeLease {
                 receipt_id: entry.receipt_id,
                 token,
+                completion: entry.completion.clone(),
             });
         }
         leases

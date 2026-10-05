@@ -920,7 +920,8 @@ fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
             TurnInput::UserInput { content, .. } => Some(content.as_slice()),
             TurnInput::ResponseItem(_)
             | TurnInput::FunctionCallOutput(_)
-            | TurnInput::InterAgentCommunication(_) => None,
+            | TurnInput::InterAgentCommunication(_)
+            | TurnInput::ExecCompletion(_) => None,
         })
         .flatten()
         .cloned()
@@ -1257,7 +1258,8 @@ async fn track_turn_resolved_config_analytics(
                     TurnInput::UserInput { content, .. } => Some(content.as_slice()),
                     TurnInput::ResponseItem(_)
                     | TurnInput::FunctionCallOutput(_)
-                    | TurnInput::InterAgentCommunication(_) => None,
+                    | TurnInput::InterAgentCommunication(_)
+                    | TurnInput::ExecCompletion(_) => None,
                 })
                 .flatten()
                 .filter(|item| {
