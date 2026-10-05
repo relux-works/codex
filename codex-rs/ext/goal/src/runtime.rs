@@ -306,6 +306,16 @@ impl GoalRuntimeHandle {
             return Ok(());
         }
         let Some(committed) = committed else {
+            if goal.status == codex_state::ThreadGoalStatus::Active
+                && let Some(manager) = self.inner.thread_manager.upgrade()
+                && let Ok(thread) = manager.get_thread(self.thread_id()).await
+            {
+                self.inner.activity.publish(
+                    thread.thread_extension_data(),
+                    self.inner.activity.revision(),
+                    Ok(Some(goal)),
+                )?;
+            }
             return Ok(());
         };
         if committed != goal {
