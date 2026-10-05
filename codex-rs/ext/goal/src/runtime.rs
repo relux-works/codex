@@ -568,7 +568,10 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         };
-        if goal.status != codex_state::ThreadGoalStatus::Active {
+        if !matches!(
+            goal.status,
+            codex_state::ThreadGoalStatus::Active | codex_state::ThreadGoalStatus::BudgetLimited
+        ) {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
