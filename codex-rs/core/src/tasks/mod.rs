@@ -490,6 +490,9 @@ impl Session {
             .input_queue
             .lease_runtime_notifications_up_to(MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST)
             .await;
+        for lease in &runtime_leases {
+            self.input_queue.acknowledge_runtime_lease(lease).await;
+        }
         let has_trigger_mail = input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         );
