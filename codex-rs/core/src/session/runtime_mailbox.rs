@@ -112,7 +112,7 @@ impl RuntimeMailbox {
     /// Leased but unacknowledged entries still count so they keep priority
     /// over goal continuation. Suspended entries never count.
     pub(crate) fn has_trigger(&self) -> bool {
-        self.entries.iter().any(|entry| !entry.suspended)
+        !self.entries.is_empty()
     }
 
     /// Leases every unleased, non-suspended entry in FIFO order.
