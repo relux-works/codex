@@ -117,7 +117,7 @@ impl RuntimeMailbox {
     pub(crate) fn has_pending(&self) -> bool {
         self.entries
             .iter()
-            .any(|entry| !entry.suspended && entry.lease.is_none())
+            .any(|entry| entry.lease.is_none())
     }
 
     /// Reports whether an unsampled, non-suspended entry exists.
