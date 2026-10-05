@@ -73,9 +73,7 @@ impl Serialize for TurnInput {
                 metadata,
             } => {
                 let mut len = 2;
-                if metadata.acceptance_order.is_some() {
-                    len += 1;
-                }
+                len += 1;
                 if !metadata.origin.is_user() {
                     len += 1;
                 }
@@ -83,9 +81,7 @@ impl Serialize for TurnInput {
                     serializer.serialize_struct_variant("TurnInput", 0, "UserInput", len)?;
                 state.serialize_field("content", content)?;
                 state.serialize_field("client_id", client_id)?;
-                if let Some(acceptance_order) = metadata.acceptance_order {
-                    state.serialize_field("acceptance_order", &acceptance_order)?;
-                }
+                state.serialize_field("acceptance_order", &metadata.acceptance_order)?;
                 if !metadata.origin.is_user() {
                     state.serialize_field("origin", &metadata.origin)?;
                 }
