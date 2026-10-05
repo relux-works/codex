@@ -1072,3 +1072,109 @@ async fn steer_preserves_request_origin(
     );
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
+
+fn runtime_receipt_for_admission(
+    store: &crate::unified_exec::completion_receipt::CompletionReceiptStore,
+    call_id: &str,
+) -> (
+    crate::unified_exec::completion_receipt::ReceiptId,
+    crate::unified_exec::completion_receipt::ReceiptOwner,
+) {
+    let owner = crate::unified_exec::completion_receipt::ReceiptOwner::new(
+        codex_protocol::ThreadId::from_u128(0x018f_0000_0000_7000_8000_0000_0000_0001),
+        /*runtime_generation*/ 7,
+        call_id,
+    )
+    .expect("test owner should be valid");
+    let receipt_id = store
+        .reserve(owner.clone())
+        .expect("reservation should succeed");
+    (receipt_id, owner)
+}
+
+fn goal_continuation_request() -> TurnInputRequest {
+    TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message(
+        "goal continuation",
+    )))
+    .on_start(TurnStartOptions {
+        turn_trigger: Some("goal".to_string()),
+        ..Default::default()
+    })
+}
+
+#[tokio::test]
+async fn runtime_entry_suppresses_automatic_goal_continuation() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_extension_api::GoalActivity {
+            goal_id: "goal-1".to_string(),
+            revision: 1,
+            state: codex_extension_api::GoalActivityState::Active,
+        });
+    let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+    let (receipt_id, owner) = runtime_receipt_for_admission(&store, "call-admission");
+    assert!(
+        session
+            .input_queue
+            .enqueue_runtime_notification(receipt_id, owner)
+            .await
+    );
+    assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
+
+    let submission = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-continuation".to_string(),
+    )
+    .await
+    .expect("goal continuation should return a typed rejection");
+    assert_eq!(
+        submission,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::PendingTriggerTurn,
+        }
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn suspended_runtime_entry_does_not_block_start_if_idle() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_extension_api::GoalActivity {
+            goal_id: "goal-1".to_string(),
+            revision: 1,
+            state: codex_extension_api::GoalActivityState::Active,
+        });
+    let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+    let (receipt_id, owner) = runtime_receipt_for_admission(&store, "call-admission-suspended");
+    assert!(
+        session
+            .input_queue
+            .enqueue_runtime_notification(receipt_id, owner)
+            .await
+    );
+    assert!(
+        session
+            .input_queue
+            .suspend_runtime_notification(receipt_id)
+            .await
+    );
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+
+    let submission = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-continuation-after-suspend".to_string(),
+    )
+    .await
+    .expect("suspended runtime must not block idle starts");
+    assert!(matches!(submission, TurnInputSubmission::Started { .. }));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
