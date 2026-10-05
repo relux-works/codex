@@ -170,7 +170,6 @@ fn escape_field(field: &str) -> String {
         match ch {
             '&' => escaped.push_str("&amp;"),
             '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
             _ if ch.is_ascii_control() => escaped.push(' '),
             _ => escaped.push(ch),
         }
