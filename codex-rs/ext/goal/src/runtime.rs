@@ -133,7 +133,14 @@ impl GoalRuntimeHandle {
 
     pub(crate) fn stop(&self, store: &ExtensionData) {
         self.inner.enabled.store(false, Ordering::Relaxed);
-        self.inner.activity.stop(store);
+        if !store
+            .get::<codex_extension_api::GoalActivity>()
+            .is_some_and(|activity| {
+                activity.state == codex_extension_api::GoalActivityState::Active
+            })
+        {
+            self.inner.activity.stop(store);
+        }
         self.inner.accounting_state.clear_active_goal();
         store.remove::<TurnStartOptions>();
         store.remove::<GoalTurnStartPermit>();
