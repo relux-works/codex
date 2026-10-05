@@ -1,6 +1,10 @@
+use super::runtime_mailbox::RuntimeLease;
+use super::runtime_mailbox::RuntimeMailbox;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
+use crate::unified_exec::completion_receipt::ReceiptId;
+use crate::unified_exec::completion_receipt::ReceiptOwner;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
 use codex_history::ResponseItemEnvelope;
@@ -95,6 +99,7 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
+    runtime_notifications: Mutex<RuntimeMailbox>,
 }
 
 struct PendingMailboxCommunication {
@@ -109,6 +114,7 @@ impl InputQueue {
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
+            runtime_notifications: Mutex::new(RuntimeMailbox::new()),
         }
     }
 
@@ -176,18 +182,93 @@ impl InputQueue {
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
     }
 
+    /// Enqueues an internal runtime notification for an exec completion.
+    ///
+    /// Returns `false` without duplicating when the receipt is already
+    /// present. Callers start idle work via `maybe_start_turn_for_pending_work`.
+    pub(crate) async fn enqueue_runtime_notification(
+        &self,
+        receipt_id: ReceiptId,
+        owner: ReceiptOwner,
+    ) -> bool {
+        let enqueued = self
+            .runtime_notifications
+            .lock()
+            .await
+            .enqueue(receipt_id, owner);
+        if enqueued {
+            self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        }
+        enqueued
+    }
+
+    /// Leases unleased, non-suspended runtime entries without removing them.
+    ///
+    /// Idle wake hands these leases to the turn starter. Active-turn delivery
+    /// arrives with the internal `TurnInput` variant in leaf 2.
+    pub(crate) async fn lease_runtime_notifications(&self) -> Vec<RuntimeLease> {
+        self.runtime_notifications.lock().await.lease_available()
+    }
+
+    /// Acknowledges a runtime lease after its contents were sampled.
+    ///
+    /// Production callers arrive with sampling acknowledgement (story D).
+    #[allow(dead_code)]
+    pub(crate) async fn acknowledge_runtime_lease(&self, lease: &RuntimeLease) -> bool {
+        self.runtime_notifications.lock().await.acknowledge(lease)
+    }
+
+    /// Returns a runtime lease to the unleased state after a failed attempt.
+    ///
+    /// Production callers arrive with sampling acknowledgement (story D).
+    #[allow(dead_code)]
+    pub(crate) async fn fail_runtime_lease(&self, lease: &RuntimeLease) -> bool {
+        let failed = self.runtime_notifications.lock().await.fail(lease);
+        if failed {
+            self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        }
+        failed
+    }
+
+    /// Removes a runtime entry whether leased or not.
+    ///
+    /// Production callers arrive with receipt cancellation (story E).
+    #[allow(dead_code)]
+    pub(crate) async fn cancel_runtime_notification(&self, receipt_id: ReceiptId) -> bool {
+        self.runtime_notifications.lock().await.cancel(receipt_id)
+    }
+
+    /// Marks a runtime entry suspended after retries are exhausted.
+    ///
+    /// Production callers arrive with bounded sampling retries (story D).
+    #[allow(dead_code)]
+    pub(crate) async fn suspend_runtime_notification(&self, receipt_id: ReceiptId) -> bool {
+        self.runtime_notifications.lock().await.suspend(receipt_id)
+    }
+
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
-        !self.mailbox_pending_mails.lock().await.is_empty()
+        if !self.mailbox_pending_mails.lock().await.is_empty() {
+            return true;
+        }
+        self.runtime_notifications.lock().await.has_pending()
     }
 
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.mailbox_pending_mails
+        if self
+            .mailbox_pending_mails
             .lock()
             .await
             .iter()
             .any(|mail| mail.communication.trigger_turn)
+        {
+            return true;
+        }
+        self.runtime_notifications.lock().await.has_trigger()
     }
 
+    /// Drains inter-agent mail, removing entries. Runtime notifications are
+    /// leased separately via [`Self::lease_runtime_notifications`] and stay
+    /// until acknowledged or cancelled.
     pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
         let pending_mails = self
             .mailbox_pending_mails
@@ -759,5 +840,184 @@ mod tests {
             .enqueue_mailbox_communication(trigger_mail, Default::default())
             .await;
         assert!(input_queue.has_trigger_turn_mailbox_items().await);
+    }
+
+    fn runtime_owner(call_id: &str) -> crate::unified_exec::completion_receipt::ReceiptOwner {
+        crate::unified_exec::completion_receipt::ReceiptOwner::new(
+            codex_protocol::ThreadId::from_u128(0x018f_0000_0000_7000_8000_0000_0000_0001),
+            /*runtime_generation*/ 7,
+            call_id,
+        )
+        .expect("test owner should be valid")
+    }
+
+    fn reserve_runtime_receipt(
+        store: &crate::unified_exec::completion_receipt::CompletionReceiptStore,
+        call_id: &str,
+    ) -> (
+        crate::unified_exec::completion_receipt::ReceiptId,
+        crate::unified_exec::completion_receipt::ReceiptOwner,
+    ) {
+        let owner = runtime_owner(call_id);
+        let receipt_id = store
+            .reserve(owner.clone())
+            .expect("reservation should succeed");
+        (receipt_id, owner)
+    }
+
+    #[tokio::test]
+    async fn input_queue_runtime_entry_survives_drain_as_leased() {
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-lease");
+        let input_queue = InputQueue::new();
+
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(receipt_id, owner)
+                .await
+        );
+        assert!(input_queue.has_pending_mailbox_items().await);
+        assert!(input_queue.has_trigger_turn_mailbox_items().await);
+
+        // Inter-agent drain leaves the runtime entry untouched.
+        let (items, _) = input_queue.drain_mailbox_input_items().await;
+        assert!(items.is_empty());
+        assert!(input_queue.has_pending_mailbox_items().await);
+
+        let leases = input_queue.lease_runtime_notifications().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].receipt_id(), receipt_id);
+        // Leased entries are handed out but stay for acknowledgement.
+        assert!(!input_queue.has_pending_mailbox_items().await);
+        assert!(input_queue.has_trigger_turn_mailbox_items().await);
+        assert!(input_queue.lease_runtime_notifications().await.is_empty());
+
+        assert!(input_queue.acknowledge_runtime_lease(&leases[0]).await);
+        assert!(!input_queue.has_pending_mailbox_items().await);
+        assert!(!input_queue.has_trigger_turn_mailbox_items().await);
+        // Double acknowledgement is refused.
+        assert!(!input_queue.acknowledge_runtime_lease(&leases[0]).await);
+    }
+
+    #[tokio::test]
+    async fn input_queue_runtime_failed_lease_retries_without_duplicate() {
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-fail");
+        let input_queue = InputQueue::new();
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(receipt_id, owner)
+                .await
+        );
+
+        let first = input_queue.lease_runtime_notifications().await;
+        assert_eq!(first.len(), 1);
+        assert!(input_queue.fail_runtime_lease(&first[0]).await);
+        assert!(!input_queue.fail_runtime_lease(&first[0]).await);
+        assert!(input_queue.has_pending_mailbox_items().await);
+
+        let second = input_queue.lease_runtime_notifications().await;
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].receipt_id(), receipt_id);
+        assert_ne!(second[0], first[0]);
+        assert!(!input_queue.acknowledge_runtime_lease(&first[0]).await);
+        assert!(input_queue.acknowledge_runtime_lease(&second[0]).await);
+    }
+
+    #[tokio::test]
+    async fn input_queue_runtime_suspended_entries_never_count_as_trigger() {
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-suspend");
+        let input_queue = InputQueue::new();
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(receipt_id, owner)
+                .await
+        );
+        assert!(input_queue.has_trigger_turn_mailbox_items().await);
+
+        assert!(input_queue.suspend_runtime_notification(receipt_id).await);
+        assert!(!input_queue.has_pending_mailbox_items().await);
+        assert!(!input_queue.has_trigger_turn_mailbox_items().await);
+        assert!(input_queue.lease_runtime_notifications().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn input_queue_runtime_cancel_removes_leased_and_unleased_entries() {
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let (leased_id, leased_owner) = reserve_runtime_receipt(&store, "call-queue-cancel-leased");
+        let (unleased_id, unleased_owner) =
+            reserve_runtime_receipt(&store, "call-queue-cancel-unleased");
+        let input_queue = InputQueue::new();
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(leased_id, leased_owner)
+                .await
+        );
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(unleased_id, unleased_owner)
+                .await
+        );
+
+        let leases = input_queue.lease_runtime_notifications().await;
+        assert_eq!(leases.len(), 2);
+        let leased_token = leases
+            .iter()
+            .find(|lease| lease.receipt_id() == leased_id)
+            .expect("leased entry should have a token");
+        let unleased_token = leases
+            .iter()
+            .find(|lease| lease.receipt_id() == unleased_id)
+            .expect("second entry should lease too");
+        assert!(input_queue.fail_runtime_lease(unleased_token).await);
+
+        assert!(input_queue.cancel_runtime_notification(leased_id).await);
+        assert!(input_queue.cancel_runtime_notification(unleased_id).await);
+        assert!(!input_queue.has_pending_mailbox_items().await);
+        assert!(!input_queue.has_trigger_turn_mailbox_items().await);
+        assert!(input_queue.lease_runtime_notifications().await.is_empty());
+        assert!(!input_queue.acknowledge_runtime_lease(leased_token).await);
+        assert!(!input_queue.fail_runtime_lease(leased_token).await);
+        assert!(!input_queue.acknowledge_runtime_lease(unleased_token).await);
+    }
+
+    #[tokio::test]
+    async fn input_queue_runtime_and_inter_agent_mail_share_trigger_queries() {
+        let store = crate::unified_exec::completion_receipt::CompletionReceiptStore::default();
+        let (receipt_id, owner) = reserve_runtime_receipt(&store, "call-queue-mixed");
+        let input_queue = InputQueue::new();
+
+        let queued_mail = make_mail(
+            AgentPath::root(),
+            AgentPath::try_from("/root/worker").expect("agent path"),
+            "queued",
+            /*trigger_turn*/ false,
+        );
+        input_queue
+            .enqueue_mailbox_communication(queued_mail, Default::default())
+            .await;
+        assert!(input_queue.has_pending_mailbox_items().await);
+        assert!(!input_queue.has_trigger_turn_mailbox_items().await);
+
+        assert!(
+            input_queue
+                .enqueue_runtime_notification(receipt_id, owner)
+                .await
+        );
+        assert!(input_queue.has_pending_mailbox_items().await);
+        assert!(input_queue.has_trigger_turn_mailbox_items().await);
+
+        // Draining inter-agent mail preserves the runtime entry and its trigger.
+        let (items, _) = input_queue.drain_mailbox_input_items().await;
+        assert_eq!(items.len(), 1);
+        assert!(input_queue.has_pending_mailbox_items().await);
+        assert!(input_queue.has_trigger_turn_mailbox_items().await);
+
+        let leases = input_queue.lease_runtime_notifications().await;
+        assert_eq!(leases.len(), 1);
+        assert!(input_queue.acknowledge_runtime_lease(&leases[0]).await);
+        assert!(!input_queue.has_pending_mailbox_items().await);
+        assert!(!input_queue.has_trigger_turn_mailbox_items().await);
     }
 }

@@ -446,8 +446,8 @@ impl Session {
     /// Starts a regular turn with the provided sub-id when pending work should wake an idle
     /// session.
     ///
-    /// The turn is created only when the session is idle and mailbox mail either requests a turn
-    /// or can wake an outstanding durable sleep.
+    /// The turn is created only when the session is idle and mailbox mail either requests a turn,
+    /// a runtime exec-completion entry is pending, or mail can wake an outstanding durable sleep.
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
@@ -484,14 +484,21 @@ impl Session {
         }
         let (input, mut start_options) =
             self.input_queue.get_pending_input(&self.active_turn).await;
-        if !input.iter().any(
+        let runtime_leases = self.input_queue.lease_runtime_notifications().await;
+        let has_trigger_mail = input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
-        ) {
+        );
+        if !has_trigger_mail {
             // Queue-only mail wakes durable sleep without selecting a new task's settings.
+            // Runtime wakes likewise preserve the thread's execution settings.
             start_options.cyber_access_program = self
                 .reference_context_item()
                 .await
                 .and_then(|context| context.cyber_access_program);
+            if !runtime_leases.is_empty() {
+                start_options.turn_trigger =
+                    Some(crate::session::runtime_mailbox::EXEC_COMPLETION_TURN_TRIGGER.to_string());
+            }
         }
         let turn_context = self
             .new_turn_with_default_settings(
