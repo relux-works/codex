@@ -188,10 +188,12 @@ impl<'call> ToolExecutor<ToolCall<'call>> for GoalToolExecutor {
             };
             // Publish before the result is observed. Refused and failed tools
             // also reconcile, so a failure never advertises uncommitted state.
-            self.runtime
-                .reconcile_live_activity(&permit)
-                .await
-                .map_err(FunctionCallError::RespondToModel)?;
+            if !matches!(self.kind, GoalToolKind::Create) {
+                self.runtime
+                    .reconcile_live_activity(&permit)
+                    .await
+                    .map_err(FunctionCallError::RespondToModel)?;
+            }
             result
         })
     }
