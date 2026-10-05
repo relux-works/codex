@@ -192,6 +192,9 @@ impl RuntimeMailbox {
         else {
             return false;
         };
+        if self.entries[index].lease.is_some() {
+            return false;
+        }
         self.entries.remove(index);
         true
     }
