@@ -595,7 +595,7 @@ impl InputQueue {
         if has_turn_pending_input {
             return true;
         }
-        !self.mailbox_pending_mails.lock().await.is_empty()
+        self.has_pending_mailbox_items().await
     }
 }
 
