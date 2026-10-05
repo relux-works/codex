@@ -301,6 +301,9 @@ impl GoalRuntimeHandle {
         previous_goal: Option<PreviousGoalSnapshot>,
     ) -> Result<(), String> {
         let permit = self.goal_state_permit().await?;
+        if goal.status == codex_state::ThreadGoalStatus::BudgetLimited {
+            return Ok(());
+        }
         let committed = self.reconcile_live_activity(&permit).await?;
         if !self.is_enabled() {
             return Ok(());
