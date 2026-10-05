@@ -446,13 +446,6 @@ where
                     "failed to stop active goal after turn error: {err}"
                 );
             }
-            if let Ok(permit) = runtime.goal_state_permit().await
-                && let Err(err) = runtime
-                    .reconcile_activity(input.thread_store, &permit)
-                    .await
-            {
-                tracing::warn!("failed to reconcile goal after turn error: {err}");
-            }
         })
     }
 }
