@@ -109,7 +109,9 @@ impl ContextualUserFragment for InternalModelContextFragment {
             return false;
         };
 
-        is_valid_source(source) && body_and_close.ends_with(CONTEXT_END_MARKER)
+        is_valid_source(source)
+            && source != "exec_completion"
+            && body_and_close.ends_with(CONTEXT_END_MARKER)
     }
 
     fn body(&self) -> String {
