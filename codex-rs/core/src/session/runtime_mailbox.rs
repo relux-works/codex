@@ -81,13 +81,6 @@ impl RuntimeMailbox {
     /// Returns `false` without duplicating when the receipt is already
     /// present, whether leased or not.
     pub(crate) fn enqueue(&mut self, receipt_id: ReceiptId, owner: ReceiptOwner) -> bool {
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.receipt_id == receipt_id)
-        {
-            return false;
-        }
         self.entries.push_back(PendingRuntimeNotification {
             receipt_id,
             owner,
