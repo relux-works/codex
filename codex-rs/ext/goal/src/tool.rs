@@ -20,6 +20,7 @@ use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
+use crate::runtime::GoalRuntimeHandle;
 use crate::spec::CREATE_GOAL_TOOL_NAME;
 use crate::spec::GET_GOAL_TOOL_NAME;
 use crate::spec::UPDATE_GOAL_TOOL_NAME;
@@ -38,6 +39,7 @@ pub(crate) struct GoalToolExecutor {
     event_emitter: GoalEventEmitter,
     metrics: GoalMetrics,
     max_goal_token_budget: Option<i64>,
+    runtime: GoalRuntimeHandle,
 }
 
 #[derive(Clone, Copy)]
@@ -80,9 +82,8 @@ enum CompletionBudgetReport {
 
 impl GoalToolExecutor {
     pub(crate) fn get(
-        thread_id: ThreadId,
+        runtime: GoalRuntimeHandle,
         state_db: Arc<codex_state::StateRuntime>,
-        accounting_state: Arc<GoalAccountingState>,
         analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
         metrics: GoalMetrics,
@@ -90,9 +91,10 @@ impl GoalToolExecutor {
         Self {
             kind: GoalToolKind::Get,
             execution_allowed: true,
-            thread_id,
+            thread_id: runtime.thread_id(),
             state_db,
-            accounting_state,
+            accounting_state: runtime.accounting_state(),
+            runtime,
             analytics,
             event_emitter,
             metrics,
@@ -101,9 +103,8 @@ impl GoalToolExecutor {
     }
 
     pub(crate) fn create(
-        thread_id: ThreadId,
+        runtime: GoalRuntimeHandle,
         state_db: Arc<codex_state::StateRuntime>,
-        accounting_state: Arc<GoalAccountingState>,
         analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
         metrics: GoalMetrics,
@@ -112,9 +113,10 @@ impl GoalToolExecutor {
         Self {
             kind: GoalToolKind::Create,
             execution_allowed: true,
-            thread_id,
+            thread_id: runtime.thread_id(),
             state_db,
-            accounting_state,
+            accounting_state: runtime.accounting_state(),
+            runtime,
             analytics,
             event_emitter,
             metrics,
@@ -123,9 +125,8 @@ impl GoalToolExecutor {
     }
 
     pub(crate) fn update(
-        thread_id: ThreadId,
+        runtime: GoalRuntimeHandle,
         state_db: Arc<codex_state::StateRuntime>,
-        accounting_state: Arc<GoalAccountingState>,
         analytics: GoalAnalytics,
         event_emitter: GoalEventEmitter,
         metrics: GoalMetrics,
@@ -133,9 +134,10 @@ impl GoalToolExecutor {
         Self {
             kind: GoalToolKind::Update,
             execution_allowed: true,
-            thread_id,
+            thread_id: runtime.thread_id(),
             state_db,
-            accounting_state,
+            accounting_state: runtime.accounting_state(),
+            runtime,
             analytics,
             event_emitter,
             metrics,
@@ -169,16 +171,28 @@ impl<'call> ToolExecutor<ToolCall<'call>> for GoalToolExecutor {
         'call: 'a,
     {
         Box::pin(async move {
-            if !self.execution_allowed {
+            if !self.execution_allowed || !self.runtime.is_enabled() {
                 return Err(FunctionCallError::RespondToModel(
                     "Goal tools require a persistent thread.".to_string(),
                 ));
             }
-            match self.kind {
+            let permit = self
+                .runtime
+                .goal_state_permit()
+                .await
+                .map_err(FunctionCallError::Fatal)?;
+            let result = match self.kind {
                 GoalToolKind::Get => self.handle_get(invocation).await,
                 GoalToolKind::Create => self.handle_create(invocation).await,
-                GoalToolKind::Update => self.handle_update(invocation).await,
-            }
+                GoalToolKind::Update => self.handle_update(invocation, &permit).await,
+            };
+            // Publish before the result is observed. Refused and failed tools
+            // also reconcile, so a failure never advertises uncommitted state.
+            self.runtime
+                .reconcile_live_activity(&permit)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            result
         })
     }
 }
@@ -247,6 +261,7 @@ impl GoalToolExecutor {
     async fn handle_update(
         &self,
         invocation: ToolCall<'_>,
+        permit: &tokio::sync::OwnedSemaphorePermit,
     ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args: UpdateGoalArgs = parse_arguments(invocation.function_arguments()?)?;
         if !matches!(
@@ -260,6 +275,7 @@ impl GoalToolExecutor {
         }
 
         self.account_active_goal_progress(
+            permit,
             match args.status {
                 ThreadGoalStatus::Complete => codex_state::GoalAccountingMode::ActiveOrComplete,
                 ThreadGoalStatus::Blocked | ThreadGoalStatus::Paused => {
@@ -329,6 +345,7 @@ impl GoalToolExecutor {
 
     async fn account_active_goal_progress(
         &self,
+        permit: &tokio::sync::OwnedSemaphorePermit,
         mode: codex_state::GoalAccountingMode,
         event_id: &str,
         budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
@@ -365,6 +382,10 @@ impl GoalToolExecutor {
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("failed to account goal progress: {err}"))
             })?;
+        self.runtime
+            .reconcile_live_activity(permit)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
         Ok(match outcome {
             codex_state::GoalAccountingOutcome::Updated(goal) => {
                 self.metrics
