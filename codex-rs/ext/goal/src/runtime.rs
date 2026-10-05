@@ -8,12 +8,16 @@ use codex_core::ThreadManager;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
 use codex_core::TurnStartOptions;
+use codex_extension_api::ExtensionData;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ThreadGoal;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
+use crate::activity::GoalActivityPublisher;
+use crate::activity::GoalTurnStartLease;
+use crate::activity::GoalTurnStartPermit;
 use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
 use crate::events::GoalEventEmitter;
@@ -21,8 +25,8 @@ use crate::metrics::GoalMetrics;
 use crate::steering::continuation_steering_item;
 use crate::steering::objective_updated_steering_item;
 use crate::tool::protocol_goal_from_state;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
-use tokio::sync::SemaphorePermit;
 
 #[derive(Clone)]
 pub struct GoalRuntimeHandle {
@@ -56,7 +60,8 @@ struct GoalRuntimeInner {
     enabled: AtomicBool,
     tools_available_for_thread: bool,
     tools_visible_for_thread: bool,
-    goal_state_lock: Semaphore,
+    goal_state_lock: Arc<Semaphore>,
+    activity: GoalActivityPublisher,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -110,13 +115,104 @@ impl GoalRuntimeHandle {
                 enabled: AtomicBool::new(config.enabled),
                 tools_available_for_thread: config.tools_available_for_thread,
                 tools_visible_for_thread: config.tools_visible_for_thread,
-                goal_state_lock: Semaphore::new(/*permits*/ 1),
+                goal_state_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                activity: GoalActivityPublisher::new(config.enabled),
             }),
         }
     }
 
-    pub(crate) fn set_enabled(&self, enabled: bool) {
+    pub(crate) fn set_enabled(&self, enabled: bool, store: &ExtensionData) {
         self.inner.enabled.store(enabled, Ordering::Relaxed);
+        self.inner.activity.set_enabled(enabled, store);
+        if !enabled {
+            self.inner.accounting_state.clear_active_goal();
+            store.remove::<TurnStartOptions>();
+            store.remove::<GoalTurnStartPermit>();
+        }
+    }
+
+    pub(crate) fn stop(&self, store: &ExtensionData) {
+        self.inner.enabled.store(false, Ordering::Relaxed);
+        self.inner.activity.stop(store);
+        self.inner.accounting_state.clear_active_goal();
+        store.remove::<TurnStartOptions>();
+        store.remove::<GoalTurnStartPermit>();
+    }
+
+    // Callers hold the goal-state permit across the committed mutation/read and
+    // publication. Always re-read: delayed tool/API callbacks are not authority.
+    pub(crate) async fn reconcile_activity(
+        &self,
+        store: &ExtensionData,
+        _permit: &OwnedSemaphorePermit,
+    ) -> Result<Option<codex_state::ThreadGoal>, String> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let revision = self.inner.activity.revision();
+        let goal = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .get_thread_goal(self.thread_id())
+            .await
+            .map_err(|err| err.to_string());
+        self.inner.activity.publish(store, revision, goal)
+    }
+
+    pub(crate) async fn reconcile_live_activity(
+        &self,
+        _permit: &OwnedSemaphorePermit,
+    ) -> Result<Option<codex_state::ThreadGoal>, String> {
+        let revision = self.inner.activity.revision();
+        let goal = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .get_thread_goal(self.thread_id())
+            .await
+            .map_err(|err| err.to_string());
+        if self.is_enabled()
+            && let Some(manager) = self.inner.thread_manager.upgrade()
+            && let Ok(thread) = manager.get_thread(self.thread_id()).await
+        {
+            return self
+                .inner
+                .activity
+                .publish(thread.thread_extension_data(), revision, goal);
+        }
+        goal
+    }
+
+    pub(crate) async fn clear_activity(&self, _permit: &OwnedSemaphorePermit) {
+        if let Some(manager) = self.inner.thread_manager.upgrade()
+            && let Ok(thread) = manager.get_thread(self.thread_id()).await
+        {
+            self.inner.activity.clear(thread.thread_extension_data());
+        }
+    }
+
+    /// Revoke the marker through the sole publisher after a goal-store read
+    /// failure observed outside reconciliation. Records Unknown and reports
+    /// the error; the next legitimate lifecycle event reconciles again.
+    pub(crate) fn revoke_activity_on_read_failure(&self, store: &ExtensionData, error: &str) {
+        let revision = self.inner.activity.revision();
+        let _ = self
+            .inner
+            .activity
+            .publish(store, revision, Err(error.to_string()));
+    }
+
+    /// Revoke the live marker after a goal-store read failure observed on a
+    /// path without direct access to the thread store (external set, fork
+    /// flush). Records Unknown and reports the error; the next legitimate
+    /// lifecycle event reconciles again.
+    pub(crate) async fn revoke_live_activity_on_read_failure(&self, error: &str) {
+        if let Some(manager) = self.inner.thread_manager.upgrade()
+            && let Ok(thread) = manager.get_thread(self.thread_id()).await
+        {
+            self.revoke_activity_on_read_failure(thread.thread_extension_data(), error);
+        }
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -153,15 +249,24 @@ impl GoalRuntimeHandle {
         thread.thread_extension_data().remove::<TurnStartOptions>();
     }
 
-    pub(crate) async fn goal_state_permit(&self) -> Result<SemaphorePermit<'_>, String> {
+    pub(crate) async fn goal_state_permit(&self) -> Result<OwnedSemaphorePermit, String> {
         self.inner
             .goal_state_lock
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|err| err.to_string())
     }
 
     pub async fn prepare_external_goal_mutation(&self) -> Result<(), String> {
+        let permit = self.goal_state_permit().await?;
+        self.prepare_external_goal_mutation_locked(&permit).await
+    }
+
+    pub(crate) async fn prepare_external_goal_mutation_locked(
+        &self,
+        permit: &OwnedSemaphorePermit,
+    ) -> Result<(), String> {
         if !self.is_enabled() {
             return Ok(());
         }
@@ -169,7 +274,8 @@ impl GoalRuntimeHandle {
         self.inner.accounting_state.reset_empty_responses();
 
         if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
-            self.account_active_goal_progress(
+            self.account_active_goal_progress_locked(
+                permit,
                 turn_id.as_str(),
                 &format!("{turn_id}:external-goal-mutation"),
                 codex_state::GoalAccountingMode::ActiveOnly,
@@ -180,6 +286,7 @@ impl GoalRuntimeHandle {
         }
 
         self.account_idle_goal_progress(
+            permit,
             &format!("{}:external-goal-mutation", self.inner.thread_id),
             codex_state::GoalAccountingMode::ActiveOnly,
             BudgetLimitedGoalDisposition::ClearActive,
@@ -193,10 +300,17 @@ impl GoalRuntimeHandle {
         goal: codex_state::ThreadGoal,
         previous_goal: Option<PreviousGoalSnapshot>,
     ) -> Result<(), String> {
+        let permit = self.goal_state_permit().await?;
+        let committed = self.reconcile_live_activity(&permit).await?;
         if !self.is_enabled() {
             return Ok(());
         }
-
+        let Some(committed) = committed else {
+            return Ok(());
+        };
+        if committed != goal {
+            return Ok(());
+        }
         self.inner.accounting_state.reset_empty_responses();
         let replaced_existing_goal = previous_goal
             .as_ref()
@@ -238,6 +352,7 @@ impl GoalRuntimeHandle {
                     let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
                     self.inject_active_turn_steering(item).await;
                 }
+                drop(permit);
                 self.continue_if_idle().await?;
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
@@ -259,12 +374,12 @@ impl GoalRuntimeHandle {
         &self,
         goal: codex_state::ThreadGoal,
     ) -> Result<(), String> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
+        let permit = self.goal_state_permit().await?;
+        let committed = self.reconcile_live_activity(&permit).await?;
         self.inner.analytics.cleared(&goal);
-        self.inner.accounting_state.clear_active_goal();
+        if committed.is_none() {
+            self.inner.accounting_state.clear_active_goal();
+        }
         Ok(())
     }
 
@@ -285,7 +400,7 @@ impl GoalRuntimeHandle {
 
         // Hold this through accounting and the status update so external goal
         // mutations and idle continuation cannot interleave between them.
-        let _goal_state_permit = self.goal_state_permit().await?;
+        let goal_state_permit = self.goal_state_permit().await?;
         let Some(accounting_goal_id) = self
             .inner
             .accounting_state
@@ -329,7 +444,8 @@ impl GoalRuntimeHandle {
                 Some(expected_goal_id),
             ),
         };
-        self.account_active_goal_progress(
+        self.account_active_goal_progress_locked(
+            &goal_state_permit,
             turn_id,
             &format!("{turn_id}:{event_name}-progress"),
             codex_state::GoalAccountingMode::ActiveOnly,
@@ -380,6 +496,7 @@ impl GoalRuntimeHandle {
         else {
             return Ok(());
         };
+        self.reconcile_live_activity(&goal_state_permit).await?;
         self.inner
             .metrics
             .record_terminal_if_status_changed(previous_status, &goal);
@@ -399,17 +516,12 @@ impl GoalRuntimeHandle {
     }
 
     pub async fn restore_after_resume(&self) -> Result<(), String> {
+        let permit = self.goal_state_permit().await?;
+        let goal = self.reconcile_live_activity(&permit).await?;
         if !self.is_enabled() {
             return Ok(());
         }
 
-        let goal = self
-            .inner
-            .state_dbs
-            .thread_goals()
-            .get_thread_goal(self.thread_id())
-            .await
-            .map_err(|err| err.to_string())?;
         match goal {
             Some(goal) if goal.status == codex_state::ThreadGoalStatus::Active => {
                 self.inner
@@ -429,8 +541,9 @@ impl GoalRuntimeHandle {
         }
         // Hold this through the read/start window so external set/clear cannot
         // change the goal after we read it but before the continuation launches.
-        let _goal_state_permit = self.goal_state_permit().await?;
+        let goal_state_permit = Arc::new(self.goal_state_permit().await?);
 
+        let goal = self.reconcile_live_activity(&goal_state_permit).await?;
         if self
             .inner
             .state_dbs
@@ -451,14 +564,7 @@ impl GoalRuntimeHandle {
             return Ok(());
         };
 
-        let Some(goal) = self
-            .inner
-            .state_dbs
-            .thread_goals()
-            .get_thread_goal(self.thread_id())
-            .await
-            .map_err(|err| err.to_string())?
-        else {
+        let Some(goal) = goal else {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         };
@@ -476,6 +582,10 @@ impl GoalRuntimeHandle {
             thread.config().await.update_plan_enabled,
         );
 
+        thread
+            .thread_extension_data()
+            .insert(GoalTurnStartPermit(Arc::clone(&goal_state_permit)));
+        let _start_lease = GoalTurnStartLease(thread.thread_extension_data());
         match thread
             .start_turn_if_idle(
                 TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
@@ -543,6 +653,25 @@ impl GoalRuntimeHandle {
         mode: codex_state::GoalAccountingMode,
         budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
     ) -> Result<Option<AccountedGoalProgress>, String> {
+        let permit = self.goal_state_permit().await?;
+        self.account_active_goal_progress_locked(
+            &permit,
+            turn_id,
+            event_id,
+            mode,
+            budget_limited_goal_disposition,
+        )
+        .await
+    }
+
+    async fn account_active_goal_progress_locked(
+        &self,
+        permit: &OwnedSemaphorePermit,
+        turn_id: &str,
+        event_id: &str,
+        mode: codex_state::GoalAccountingMode,
+        budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
+    ) -> Result<Option<AccountedGoalProgress>, String> {
         let accounting = self.accounting_state();
         let _accounting_permit = accounting
             .progress_accounting_permit()
@@ -567,6 +696,7 @@ impl GoalRuntimeHandle {
             )
             .await
             .map_err(|err| err.to_string())?;
+        self.reconcile_live_activity(permit).await?;
         Ok(match outcome {
             codex_state::GoalAccountingOutcome::Updated(goal) => {
                 let goal_id = goal.goal_id.clone();
@@ -601,6 +731,7 @@ impl GoalRuntimeHandle {
 
     async fn account_idle_goal_progress(
         &self,
+        permit: &OwnedSemaphorePermit,
         event_id: &str,
         mode: codex_state::GoalAccountingMode,
         budget_limited_goal_disposition: BudgetLimitedGoalDisposition,
@@ -629,6 +760,7 @@ impl GoalRuntimeHandle {
             )
             .await
             .map_err(|err| err.to_string())?;
+        self.reconcile_live_activity(permit).await?;
         Ok(match outcome {
             codex_state::GoalAccountingOutcome::Updated(goal) => {
                 let goal_id = goal.goal_id.clone();

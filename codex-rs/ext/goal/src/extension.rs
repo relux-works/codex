@@ -38,6 +38,7 @@ use codex_protocol::protocol::TokenUsageInfo;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
+use crate::activity::GoalTurnStartPermit;
 use crate::analytics::GoalAnalytics;
 use crate::api::GoalService;
 use crate::events::GoalEventEmitter;
@@ -157,7 +158,7 @@ where
                     },
                 )
             });
-            runtime.set_enabled(enabled);
+            runtime.set_enabled(enabled, input.thread_store);
             self.goal_service.register_runtime(&runtime);
         })
     }
@@ -168,7 +169,16 @@ where
                 return;
             };
 
-            if let Err(err) = runtime.restore_after_resume().await {
+            let restored = async {
+                let permit = runtime.goal_state_permit().await?;
+                runtime
+                    .reconcile_activity(input.thread_store, &permit)
+                    .await?;
+                drop(permit);
+                runtime.restore_after_resume().await
+            }
+            .await;
+            if let Err(err) = restored {
                 tracing::warn!(
                     "failed to restore goal runtime after thread resume for {}: {err}",
                     runtime.thread_id()
@@ -195,6 +205,7 @@ where
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             if let Some(runtime) = goal_runtime_handle(input.thread_store) {
+                runtime.stop(input.thread_store);
                 self.goal_service.unregister_runtime(&runtime);
             }
         })
@@ -216,7 +227,7 @@ where
         let enabled = config.enabled;
         thread_store.insert(config);
         if let Some(runtime) = goal_runtime_handle(thread_store) {
-            runtime.set_enabled(enabled);
+            runtime.set_enabled(enabled, thread_store);
         }
     }
 }
@@ -234,6 +245,28 @@ where
                 return;
             }
 
+            let goal = {
+                let permit =
+                    if let Some(shared) = input.thread_store.remove::<GoalTurnStartPermit>() {
+                        Arc::clone(&shared.0)
+                    } else {
+                        let Ok(permit) = runtime.goal_state_permit().await else {
+                            return;
+                        };
+                        Arc::new(permit)
+                    };
+                match runtime
+                    .reconcile_activity(input.thread_store, &permit)
+                    .await
+                {
+                    Ok(goal) => goal,
+                    Err(err) => {
+                        runtime.accounting_state().clear_active_goal();
+                        tracing::warn!("failed to reconcile goal at turn start: {err}");
+                        return;
+                    }
+                }
+            };
             let Some(token_usage_at_turn_start) = input.token_usage_at_turn_start else {
                 tracing::warn!("skipping goal turn accounting: token baseline unavailable");
                 return;
@@ -261,14 +294,6 @@ where
                 accounting.clear_current_turn_goal();
                 return;
             }
-            let Ok(goal) = self
-                .state_dbs
-                .thread_goals()
-                .get_thread_goal(runtime.thread_id())
-                .await
-            else {
-                return;
-            };
             if let Some(goal) = goal
                 && matches!(
                     goal.status,
@@ -317,6 +342,7 @@ where
                     )
                     .await
             {
+                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 input.thread_store.remove::<TurnStartOptions>();
                 tracing::warn!(
                     "failed to stop active goal after repeated execution failures for {turn_id}: {err}"
@@ -327,6 +353,7 @@ where
                 .stop_active_goal_for_turn(turn_id, ActiveGoalStopReason::EmptyResponse)
                 .await
             {
+                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 input.thread_store.remove::<TurnStartOptions>();
                 tracing::warn!("failed to stop goal after empty responses for {turn_id}: {err}");
                 return;
@@ -340,6 +367,7 @@ where
                 )
                 .await
             {
+                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 input.thread_store.remove::<TurnStartOptions>();
                 tracing::warn!(
                     "failed to account active goal progress at turn stop for {turn_id}: {err}"
@@ -385,6 +413,7 @@ where
                 )
                 .await
             {
+                runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                 tracing::warn!(
                     "failed to account active goal progress after turn abort for {turn_id}: {err}"
                 );
@@ -416,6 +445,13 @@ where
                     error = ?input.error,
                     "failed to stop active goal after turn error: {err}"
                 );
+            }
+            if let Ok(permit) = runtime.goal_state_permit().await
+                && let Err(err) = runtime
+                    .reconcile_activity(input.thread_store, &permit)
+                    .await
+            {
+                tracing::warn!("failed to reconcile goal after turn error: {err}");
             }
         })
     }
@@ -462,6 +498,19 @@ where
             if !runtime.is_enabled() {
                 return;
             }
+            {
+                let Ok(permit) = runtime.goal_state_permit().await else {
+                    return;
+                };
+                if let Err(err) = runtime
+                    .reconcile_activity(input.thread_store, &permit)
+                    .await
+                {
+                    runtime.accounting_state().clear_active_goal();
+                    tracing::warn!("failed to reconcile goal after tool finish: {err}");
+                    return;
+                }
+            }
             runtime.accounting_state().record_tool_outcome(
                 input.turn_id,
                 input.tool_name,
@@ -504,12 +553,25 @@ where
                 Ok(Some(progress)) => progress,
                 Ok(None) => return,
                 Err(err) => {
+                    runtime.revoke_activity_on_read_failure(input.thread_store, &err);
                     tracing::warn!(
                         "failed to account active goal progress after tool finish for {turn_id}: {err}"
                     );
                     return;
                 }
             };
+            {
+                let Ok(permit) = runtime.goal_state_permit().await else {
+                    return;
+                };
+                if let Err(err) = runtime
+                    .reconcile_activity(input.thread_store, &permit)
+                    .await
+                {
+                    tracing::warn!("failed to reconcile accounted goal: {err}");
+                    return;
+                }
+            }
             let goal = progress.goal;
             if goal.status != ThreadGoalStatus::BudgetLimited {
                 return;
@@ -549,26 +611,23 @@ where
 
         let tools = [
             GoalToolExecutor::get(
-                runtime.thread_id(),
+                runtime.as_ref().clone(),
                 Arc::clone(&self.state_dbs),
-                runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),
             ),
             GoalToolExecutor::create(
-                runtime.thread_id(),
+                runtime.as_ref().clone(),
                 Arc::clone(&self.state_dbs),
-                runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),
                 max_goal_token_budget,
             ),
             GoalToolExecutor::update(
-                runtime.thread_id(),
+                runtime.as_ref().clone(),
                 Arc::clone(&self.state_dbs),
-                runtime.accounting_state(),
                 self.analytics.clone(),
                 self.event_emitter.clone(),
                 self.metrics.clone(),

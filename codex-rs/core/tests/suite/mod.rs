@@ -82,6 +82,8 @@ mod extension_sandbox;
 mod external_auth;
 mod fork_thread;
 mod git_enrichment;
+#[path = "goal_activity_tests.rs"]
+mod goal_activity;
 mod guardian_authorization;
 mod guardian_authorization_refresh;
 #[path = "guardian_cached_score_tests.rs"]
