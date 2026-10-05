@@ -252,6 +252,7 @@ mod retained_context;
 mod review;
 mod rollout_budget;
 mod rollout_reconstruction;
+pub(crate) mod runtime_mailbox;
 #[allow(clippy::module_inception)]
 pub(crate) mod session;
 pub(crate) mod startup_prewarm;

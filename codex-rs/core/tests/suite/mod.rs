@@ -192,6 +192,7 @@ mod rmcp_client;
 mod rollout_budget;
 mod rollout_compression;
 mod rollout_list_find;
+mod runtime_mailbox;
 mod safety_buffering;
 mod safety_check_downgrade;
 mod scenarios;

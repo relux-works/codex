@@ -345,6 +345,50 @@ impl CodexThread {
         self.session.flush_rollout().await
     }
 
+    /// Enqueues one internal exec-completion notification for testing.
+    ///
+    /// Test-only: reserves a real completion receipt, arms and publishes a
+    /// successful exit, enqueues the runtime mailbox entry, and wakes idle
+    /// work. Production enqueue arrives with receipt publication (story E);
+    /// no protocol or app-server surface is added here.
+    #[doc(hidden)]
+    pub async fn test_enqueue_exec_completion_notification(&self) -> bool {
+        use crate::unified_exec::completion_receipt::InitialResponseDecision;
+        use crate::unified_exec::completion_receipt::ReceiptOwner;
+        use crate::unified_exec::completion_receipt::TerminalCompletion;
+
+        let Ok(owner) = ReceiptOwner::new(
+            self.session.thread_id,
+            /*runtime_generation*/ 1,
+            format!("test-call-{}", uuid::Uuid::new_v4()),
+        ) else {
+            return false;
+        };
+        let store = self.session.services.unified_exec_manager.receipt_store();
+        let Ok(receipt_id) = store.reserve(owner.clone()) else {
+            return false;
+        };
+        let _ = store.resolve_initial_response(receipt_id, &owner, InitialResponseDecision::Arm);
+        let _ = store.publish_exit(
+            receipt_id,
+            &owner,
+            TerminalCompletion {
+                exit_code: Some(0),
+                timed_out: false,
+            },
+        );
+        if !self
+            .session
+            .input_queue
+            .enqueue_runtime_notification(receipt_id, owner)
+            .await
+        {
+            return false;
+        }
+        self.session.maybe_start_turn_for_pending_work().await;
+        true
+    }
+
     pub async fn submit_with_trace(
         &self,
         op: Op,
