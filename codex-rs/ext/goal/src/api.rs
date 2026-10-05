@@ -415,9 +415,7 @@ impl GoalService {
             Ok(goal) => Ok(goal),
             Err(err) => {
                 let message = format!("failed to read thread goal: {err}");
-                if let Some(runtime) = runtime {
-                    runtime.revoke_live_activity_on_read_failure(&message).await;
-                }
+                let _ = runtime;
                 Err(GoalServiceError::Internal(message))
             }
         }
