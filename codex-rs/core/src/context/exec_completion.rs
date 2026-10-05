@@ -27,7 +27,7 @@ use codex_protocol::models::ContentItemKind;
 pub(crate) const MAX_EXEC_COMPLETION_FRAGMENT_BYTES: usize = 768;
 
 /// Maximum fragments attached to one sampling request (at most 6144 bytes).
-pub(crate) const MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST: usize = 8;
+pub(crate) const MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST: usize = 9;
 
 /// Internal-context source label for exec-completion fragments.
 const EXEC_COMPLETION_SOURCE: &str = "exec_completion";
