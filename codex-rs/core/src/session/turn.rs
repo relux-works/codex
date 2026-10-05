@@ -36,6 +36,7 @@ use crate::responses_retry::handle_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
+use crate::session::exec_completion_ack;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -1691,6 +1692,11 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
+                // The submitted prompt reached the selected transport: this is
+                // the only acknowledgement point. Membership decides exactly
+                // which tracked leases are sampled.
+                exec_completion_ack::acknowledge_submitted(&sess, &turn_context, &prompt.input)
+                    .await;
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(err) => match err.details() {
