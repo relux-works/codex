@@ -340,7 +340,7 @@ impl GoalService {
         // fails, so any error revokes through the sole publisher instead of
         // escaping past the settlement below.
         let cleared_goal = Self::guard_live_store_result(
-            runtime.as_ref(),
+            None,
             state_db
                 .thread_goals()
                 .delete_thread_goal(thread_id)
