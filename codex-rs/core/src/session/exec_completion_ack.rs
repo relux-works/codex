@@ -85,12 +85,9 @@ pub(crate) fn items_contain_lease<'a>(
         ExecCompletionFragment::new(lease.receipt_id().model_handle(), lease.completion());
     let role = fragment.role();
     let expected = fragment.render();
+    let _ = &role;
     items.any(|item| match item {
-        ResponseItem::Message {
-            role: item_role,
-            content,
-            ..
-        } if item_role == role => content
+        ResponseItem::Message { content, .. } => content
             .iter()
             .any(|entry| matches!(entry, ContentItem::InputText { text } if text == &expected)),
         _ => false,
