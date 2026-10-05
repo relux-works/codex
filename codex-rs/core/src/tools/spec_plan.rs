@@ -62,6 +62,7 @@ use crate::tools::router::ToolRouter;
 use crate::tools::tool_namespaces_info::collect_tool_namespaces_info;
 use codex_connectors::apps_config_from_layer_stack;
 use codex_extension_api::ExtensionData;
+use codex_extension_api::GoalActivity;
 use codex_features::Feature;
 use codex_features::SleepToolMode;
 use codex_login::AuthManager;
@@ -110,6 +111,7 @@ struct CoreToolPlanContext<'a> {
     tool_policy: &'a codex_extension_api::ToolPolicy,
     turn_context: &'a TurnContext,
     model_info: &'a ModelInfo,
+    goal_activity_present: bool,
     environments: &'a TurnEnvironmentSnapshot,
     mcp: &'a codex_mcp::McpBinding,
     tool_suggest_candidates: Option<&'a crate::tools::router::ToolSuggestCandidates>,
@@ -140,6 +142,11 @@ pub(crate) fn build_tool_router(
         tool_policy: &session.tool_policy,
         turn_context,
         model_info,
+        goal_activity_present: session
+            .services
+            .thread_extension_data
+            .get::<GoalActivity>()
+            .is_some(),
         environments,
         mcp,
         tool_suggest_candidates,
@@ -285,6 +292,7 @@ pub(crate) fn build_core_tool_registry(
         tool_policy: &Default::default(),
         turn_context,
         model_info,
+        goal_activity_present: false,
         environments,
         mcp,
         tool_suggest_candidates,
@@ -1242,7 +1250,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, registry: &mut Tool
                         .as_ref()
                         .is_some_and(|config| config.sleep_tool)
                 } else {
-                    model_has_clock
+                    model_has_clock || context.goal_activity_present
                 }
             }
         }
