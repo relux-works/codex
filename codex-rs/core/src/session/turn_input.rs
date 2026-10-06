@@ -57,7 +57,7 @@ mod tests;
 
 /// Why input is starting a turn; shared by admission and input delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TurnStartKind {
+pub(crate) enum TurnStartKind {
     User,
     Automatic,
     Recovery,
@@ -453,6 +453,15 @@ async fn start_if_idle(
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
         });
+    }
+
+    let start_trigger = start.turn_trigger.clone();
+    if let Some(reason) =
+        super::goal_admission::check_goal_admission(session, kind, start_trigger.as_deref())
+    {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted { reason });
     }
 
     let settings = match PreparedTurnInputSettings::prepare(session, thread_settings, start).await {

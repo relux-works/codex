@@ -20,6 +20,9 @@ use crate::activity::GoalTurnStartLease;
 use crate::activity::GoalTurnStartPermit;
 use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
+use crate::background_wait::BackgroundWaitEvaluation;
+use crate::background_wait::BackgroundWaitState;
+use crate::background_wait::GoalWaitStatus;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
 use crate::steering::continuation_steering_item;
@@ -62,6 +65,7 @@ struct GoalRuntimeInner {
     tools_visible_for_thread: bool,
     goal_state_lock: Arc<Semaphore>,
     activity: GoalActivityPublisher,
+    background_wait: Arc<BackgroundWaitState>,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -117,6 +121,7 @@ impl GoalRuntimeHandle {
                 tools_visible_for_thread: config.tools_visible_for_thread,
                 goal_state_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
                 activity: GoalActivityPublisher::new(config.enabled),
+                background_wait: Arc::new(BackgroundWaitState::new()),
             }),
         }
     }
@@ -135,8 +140,14 @@ impl GoalRuntimeHandle {
         self.inner.enabled.store(false, Ordering::Relaxed);
         self.inner.activity.stop(store);
         self.inner.accounting_state.clear_active_goal();
+        self.inner.background_wait.note_stop();
         store.remove::<TurnStartOptions>();
         store.remove::<GoalTurnStartPermit>();
+    }
+
+    /// Goal-owned background waiting policy for this thread.
+    pub fn background_wait_state(&self) -> Arc<BackgroundWaitState> {
+        Arc::clone(&self.inner.background_wait)
     }
 
     // Callers hold the goal-state permit across the committed mutation/read and
@@ -333,6 +344,7 @@ impl GoalRuntimeHandle {
         self.inner
             .analytics
             .status_changed(&goal, previous_status, GoalEventAttribution::NoTurn);
+        self.inner.background_wait.note_goal_mutation();
         let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
             !replaced_existing_goal && previous_goal.objective != goal.objective
         });
@@ -377,6 +389,7 @@ impl GoalRuntimeHandle {
         let permit = self.goal_state_permit().await?;
         let committed = self.reconcile_live_activity(&permit).await?;
         self.inner.analytics.cleared(&goal);
+        self.inner.background_wait.note_clear();
         if committed.is_none() {
             self.inner.accounting_state.clear_active_goal();
         }
@@ -506,6 +519,7 @@ impl GoalRuntimeHandle {
             GoalEventAttribution::Turn(turn_id),
         );
         self.inner.accounting_state.clear_active_goal();
+        self.inner.background_wait.note_goal_mutation();
         let goal = protocol_goal_from_state(goal);
         self.inner.event_emitter.thread_goal_updated(
             format!("{turn_id}:{event_name}"),
@@ -518,6 +532,7 @@ impl GoalRuntimeHandle {
     pub async fn restore_after_resume(&self) -> Result<(), String> {
         let permit = self.goal_state_permit().await?;
         let goal = self.reconcile_live_activity(&permit).await?;
+        self.inner.background_wait.note_resume();
         if !self.is_enabled() {
             return Ok(());
         }
@@ -571,6 +586,52 @@ impl GoalRuntimeHandle {
         if goal.status != codex_state::ThreadGoalStatus::Active {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
+        }
+        if self.inner.background_wait.is_enabled() {
+            let snapshot = codex_extension_api::read_pending_work(thread.thread_extension_data());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            match self.inner.background_wait.evaluate_continuation(
+                goal.goal_id.as_str(),
+                GoalWaitStatus::Active,
+                snapshot,
+                now,
+            ) {
+                BackgroundWaitEvaluation::ProceedWithoutGate
+                | BackgroundWaitEvaluation::ProceedNormal { .. }
+                | BackgroundWaitEvaluation::ProceedWithTicket { .. } => {
+                    thread
+                        .thread_extension_data()
+                        .insert(self.inner.background_wait.admission_checker());
+                }
+                BackgroundWaitEvaluation::Wait {
+                    next_check_in,
+                    emit_warning,
+                } => {
+                    if emit_warning {
+                        self.inner.event_emitter.background_wait_warning(
+                            self.thread_id().to_string(),
+                            crate::background_wait::CHECK_INS_STOPPED_WARNING.to_string(),
+                        );
+                    }
+                    tracing::debug!(
+                        ?next_check_in,
+                        "goal continuation waiting for subscribed work"
+                    );
+                    drop(goal_state_permit);
+                    return Ok(());
+                }
+                BackgroundWaitEvaluation::WaitOnReadFailure { error } => {
+                    tracing::warn!(
+                        %error,
+                        "goal continuation waiting: pending-work read failed, \
+                         safe behavior treats failure as unknown rather than empty"
+                    );
+                    drop(goal_state_permit);
+                    return Ok(());
+                }
+            }
         }
         let start_options = thread
             .thread_extension_data()
@@ -633,6 +694,7 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn inject_active_turn_steering(&self, item: ResponseItem) {
+        self.inner.background_wait.note_steering();
         let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
             tracing::debug!("skipping goal steering because thread manager is unavailable");
             return;
