@@ -640,16 +640,6 @@ impl Session {
             // retries it instead of stranding it leased. Failing an
             // already-failed lease is a no-op.
             exec_completion_ack::fail_leases(self, /*turn_context*/ None, &runtime_leases).await;
-            if !runtime_leases.is_empty() {
-                // The winner may already have finished: its teardown
-                // scheduler skipped these entries while they were still
-                // leased, so without a pass here the fail-back leaves an
-                // idle session with pending receipts and no future wake.
-                // This cannot double-wake a live winner (the scheduler
-                // returns on an active turn) nor spin on suspended entries
-                // (they no longer count as pending).
-                self.maybe_start_turn_for_pending_work().await;
-            }
         }
     }
 
