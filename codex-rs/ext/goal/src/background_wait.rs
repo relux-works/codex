@@ -159,7 +159,6 @@ impl WaitState {
 
     fn invalidate_tickets(&mut self) {
         self.generation += 1;
-        self.outstanding_ticket = None;
         self.admission_attempt = None;
     }
 }
