@@ -307,9 +307,7 @@ impl BackgroundWaitState {
         }
         let snapshot = match snapshot {
             Ok(snapshot) => snapshot,
-            Err(error) => {
-                return BackgroundWaitEvaluation::WaitOnReadFailure { error };
-            }
+            Err(_) => PendingWorkSnapshot::empty(0),
         };
         if snapshot.is_empty() {
             state.wait_started_at = None;
