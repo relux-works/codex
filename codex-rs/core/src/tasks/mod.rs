@@ -299,9 +299,9 @@ impl TurnStartClaim {
                 debug_assert!(turn.task.is_none());
                 Some(turn)
             }
-            TurnStartClaim::Reserved(expected) => {
+            TurnStartClaim::Reserved(_expected) => {
                 let turn = active.as_mut()?;
-                if turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, expected) {
+                if turn.task.is_none() {
                     Some(turn)
                 } else {
                     None
