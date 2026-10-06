@@ -190,11 +190,24 @@ pub(crate) struct UnifiedExecProcessManager {
 
 impl UnifiedExecProcessManager {
     pub(crate) fn new(max_write_stdin_yield_time_ms: u64) -> Self {
+        Self::new_with_revision(
+            max_write_stdin_yield_time_ms,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        )
+    }
+
+    /// Creates a manager sharing the given pending-work revision.
+    pub(crate) fn new_with_revision(
+        max_write_stdin_yield_time_ms: u64,
+        revision: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         Self {
             process_store: Mutex::new(ProcessStore::default()),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
-            receipt_store: Arc::new(completion_receipt::CompletionReceiptStore::default()),
+            receipt_store: Arc::new(completion_receipt::CompletionReceiptStore::with_revision(
+                revision,
+            )),
             receipt_hooks: Arc::new(Mutex::new(receipt_hooks::ReceiptHooksState::default())),
             receipt_generation: receipt_hooks::next_receipt_generation(),
         }

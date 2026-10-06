@@ -25,6 +25,9 @@
 //! [iac]: codex_protocol::protocol::InterAgentCommunication
 
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use uuid::Uuid;
 
@@ -53,11 +56,15 @@ pub(crate) const MAX_RUNTIME_SAMPLING_ATTEMPTS: u32 = 3;
 /// presented to acknowledge or fail the lease. Callers cannot mint leases.
 /// The completion snapshot was captured at mailbox admission and is what the
 /// record path renders; story D acknowledges the lease after sampling.
+/// The owner is the B receipt owner captured at admission; the sampling
+/// acceptance path uses it to retire the receipt store claim together with
+/// the mailbox entry so sampled work never resurrects as pending.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeLease {
     receipt_id: ReceiptId,
     token: Uuid,
     completion: ExecCompletion,
+    owner: ReceiptOwner,
 }
 
 impl RuntimeLease {
@@ -68,14 +75,18 @@ impl RuntimeLease {
     pub(crate) fn completion(&self) -> &ExecCompletion {
         &self.completion
     }
+
+    pub(crate) fn owner(&self) -> &ReceiptOwner {
+        &self.owner
+    }
 }
 
 /// One pending runtime notification carrying a receipt reference.
 #[derive(Debug)]
 struct PendingRuntimeNotification {
     receipt_id: ReceiptId,
-    // Carries the B receipt owner for retained-output reads (story E).
-    #[allow(dead_code)]
+    // Carries the B receipt owner: leases clone it so sampling acceptance
+    // can retire the store claim, and retained-output reads use it (story E).
     owner: ReceiptOwner,
     completion: ExecCompletion,
     suspended: bool,
@@ -85,6 +96,14 @@ struct PendingRuntimeNotification {
     attempts: u32,
 }
 
+/// Read-only view of one mailbox entry for pending-work snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MailboxEntrySnapshot {
+    pub(crate) receipt_id: ReceiptId,
+    pub(crate) leased: bool,
+    pub(crate) suspended: bool,
+}
+
 /// Mailbox-side lease tracking for runtime notifications.
 ///
 /// Entries are removed only by acknowledgement or cancellation. Draining
@@ -92,11 +111,46 @@ struct PendingRuntimeNotification {
 #[derive(Debug, Default)]
 pub(crate) struct RuntimeMailbox {
     entries: VecDeque<PendingRuntimeNotification>,
+    revision: Arc<AtomicU64>,
 }
 
 impl RuntimeMailbox {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a mailbox sharing the given pending-work revision.
+    pub(crate) fn with_revision(revision: Arc<AtomicU64>) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            revision,
+        }
+    }
+
+    /// Returns the current pending-work revision.
+    #[cfg(test)]
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Snapshots every entry's lease and suspension state.
+    ///
+    /// Callers hold the mailbox lock once across this read so Queued, Leased,
+    /// and suspended views stay consistent.
+    pub(crate) fn snapshot_entries(&self) -> Vec<MailboxEntrySnapshot> {
+        self.entries
+            .iter()
+            .map(|entry| MailboxEntrySnapshot {
+                receipt_id: entry.receipt_id,
+                leased: entry.lease.is_some(),
+                suspended: entry.suspended,
+            })
+            .collect()
     }
 
     /// Enqueues a runtime notification for a completion receipt.
@@ -125,6 +179,7 @@ impl RuntimeMailbox {
             lease: None,
             attempts: 0,
         });
+        self.bump_revision();
         true
     }
 
@@ -174,7 +229,11 @@ impl RuntimeMailbox {
                 receipt_id: entry.receipt_id,
                 token,
                 completion: entry.completion.clone(),
+                owner: entry.owner.clone(),
             });
+        }
+        if !leases.is_empty() {
+            self.bump_revision();
         }
         leases
     }
@@ -197,6 +256,7 @@ impl RuntimeMailbox {
             return false;
         }
         self.entries.remove(index);
+        self.bump_revision();
         true
     }
 
@@ -222,10 +282,10 @@ impl RuntimeMailbox {
         entry.lease = None;
         entry.attempts = entry.attempts.saturating_add(1);
         let exhausted = entry.attempts >= MAX_RUNTIME_SAMPLING_ATTEMPTS;
-        let receipt_id = entry.receipt_id;
         if exhausted {
-            self.suspend(receipt_id);
+            entry.suspended = true;
         }
+        self.bump_revision();
         true
     }
 
@@ -254,6 +314,7 @@ impl RuntimeMailbox {
             return false;
         };
         self.entries.remove(index);
+        self.bump_revision();
         true
     }
 
@@ -270,6 +331,7 @@ impl RuntimeMailbox {
             return false;
         };
         entry.suspended = true;
+        self.bump_revision();
         true
     }
 }

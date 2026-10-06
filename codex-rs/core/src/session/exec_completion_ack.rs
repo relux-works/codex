@@ -26,6 +26,13 @@
 //! acknowledgement removes it from tracking and from the mailbox, and failing
 //! an acknowledged lease is a no-op.
 //!
+//! Acceptance also retires the B receipt store claim for the same receipt, so
+//! the pending-work snapshot never resurrects sampled work from the store.
+//! The mailbox acknowledgement gates the store acknowledgement: only a lease
+//! whose mailbox entry was actually removed retires its store receipt, and a
+//! stale token skips both. Each store bumps the shared pending-work revision
+//! on its own transition, so one acceptance strictly increases the revision.
+//!
 //! [fail]: super::runtime_mailbox::RuntimeMailbox::fail
 //! [max]: super::runtime_mailbox::MAX_RUNTIME_SAMPLING_ATTEMPTS
 
@@ -143,6 +150,14 @@ pub(crate) fn is_acceptance_event(event: &ResponseEvent) -> bool {
 /// and untracked; non-members (omitted from the prompt, e.g. by compaction)
 /// stay tracked so a later request in this turn can still sample them, and
 /// turn end fails whatever remains.
+///
+/// Each member retires both its mailbox entry and its B receipt store claim,
+/// in that order. The mailbox removal gates the store retirement: a stale
+/// token removes nothing and retires nothing, so a fail after acknowledgement
+/// stays a no-op in both stores. A store lease failure means another path
+/// already retired the receipt (stdin claim, release) or currently holds the
+/// single claim; the mailbox removal is still the acceptance, and the store
+/// side resolves to terminal without resurrecting the receipt.
 pub(crate) async fn acknowledge_submitted(
     sess: &Session,
     turn_context: &TurnContext,
@@ -166,7 +181,14 @@ pub(crate) async fn acknowledge_submitted(
         return;
     }
     for lease in &members {
-        sess.input_queue.acknowledge_runtime_lease(lease).await;
+        if !sess.input_queue.acknowledge_runtime_lease(lease).await {
+            continue;
+        }
+        let manager = &sess.services.unified_exec_manager;
+        if let Ok(store_lease) = manager.lease_pushed_completion(lease.receipt_id(), lease.owner())
+        {
+            let _ = manager.acknowledge_pushed_completion(&store_lease).await;
+        }
     }
     tracked
         .leases

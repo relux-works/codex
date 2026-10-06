@@ -1,3 +1,4 @@
+use super::runtime_mailbox::MailboxEntrySnapshot;
 use super::runtime_mailbox::RuntimeLease;
 use super::runtime_mailbox::RuntimeMailbox;
 use crate::context::ExecCompletion;
@@ -19,6 +20,8 @@ use serde::Serializer;
 use serde::ser::SerializeStructVariant as _;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -177,6 +180,7 @@ pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
     runtime_notifications: Mutex<RuntimeMailbox>,
+    pending_work_revision: Arc<AtomicU64>,
 }
 
 struct PendingMailboxCommunication {
@@ -186,13 +190,45 @@ struct PendingMailboxCommunication {
 }
 
 impl InputQueue {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::new_with_revision(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Creates a queue sharing the given pending-work revision.
+    pub(crate) fn new_with_revision(revision: Arc<AtomicU64>) -> Self {
         let (activity_tx, _) = watch::channel(InputQueueActivity::Mailbox);
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
-            runtime_notifications: Mutex::new(RuntimeMailbox::new()),
+            runtime_notifications: Mutex::new(RuntimeMailbox::with_revision(Arc::clone(&revision))),
+            pending_work_revision: revision,
         }
+    }
+
+    /// Returns the current pending-work revision without locking the mailbox.
+    pub(crate) fn pending_work_revision(&self) -> u64 {
+        self.pending_work_revision.load(Ordering::SeqCst)
+    }
+
+    /// Snapshots runtime mailbox entries with a non-blocking lock.
+    ///
+    /// Returns an explicit reason when the mailbox is contended so snapshot
+    /// readers fail instead of stalling a turn.
+    pub(crate) fn try_snapshot_runtime_mailbox(&self) -> Result<Vec<MailboxEntrySnapshot>, String> {
+        let guard = self
+            .runtime_notifications
+            .try_lock()
+            .map_err(|err| err.to_string())?;
+        Ok(guard.snapshot_entries())
+    }
+
+    /// Holds the runtime mailbox lock, for contended-read tests.
+    #[cfg(test)]
+    pub(crate) async fn test_hold_runtime_lock(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, RuntimeMailbox> {
+        self.runtime_notifications.lock().await
     }
 
     pub(crate) async fn subscribe_activity(
