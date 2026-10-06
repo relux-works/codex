@@ -6639,11 +6639,16 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         }),
     )
     .expect("initialize test hooks");
+    // Mirror `Session::new`: the receipt store and the input queue share one
+    // pending-work revision counter so receipt transitions are visible to
+    // `try_read_snapshot`.
+    let pending_work_revision = Arc::new(AtomicU64::new(0));
     let services = SessionServices {
         mcp_runtime,
         mcp_handler_cache: Default::default(),
-        unified_exec_manager: UnifiedExecProcessManager::new(
+        unified_exec_manager: UnifiedExecProcessManager::new_with_revision(
             config.background_terminal_max_timeout,
+            Arc::clone(&pending_work_revision),
         ),
         elicitations: crate::elicitation::ElicitationService::new(),
         shell_zsh_path: None,
@@ -6756,7 +6761,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         realtime_history: None,
         active_turn: Mutex::new(None),
         async_hook_results,
-        input_queue: super::input_queue::InputQueue::new(),
+        input_queue: super::input_queue::InputQueue::new_with_revision(pending_work_revision),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
@@ -8915,11 +8920,16 @@ where
         }),
     )
     .expect("initialize test hooks");
+    // Mirror `Session::new`: the receipt store and the input queue share one
+    // pending-work revision counter so receipt transitions are visible to
+    // `try_read_snapshot`.
+    let pending_work_revision = Arc::new(AtomicU64::new(0));
     let services = SessionServices {
         mcp_runtime,
         mcp_handler_cache: Default::default(),
-        unified_exec_manager: UnifiedExecProcessManager::new(
+        unified_exec_manager: UnifiedExecProcessManager::new_with_revision(
             config.background_terminal_max_timeout,
+            Arc::clone(&pending_work_revision),
         ),
         elicitations: crate::elicitation::ElicitationService::new(),
         shell_zsh_path: None,
@@ -9032,7 +9042,7 @@ where
         realtime_history: None,
         active_turn: Mutex::new(None),
         async_hook_results,
-        input_queue: super::input_queue::InputQueue::new(),
+        input_queue: super::input_queue::InputQueue::new_with_revision(pending_work_revision),
         services,
         git_enrichment_policy: GitEnrichmentPolicy::Fresh,
         fork_persistence: ForkPersistence::Copied,
