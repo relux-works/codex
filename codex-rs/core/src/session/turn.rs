@@ -36,6 +36,7 @@ use crate::responses_retry::handle_response_stream_error;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::daemon_recovery::RecordedTurnInput;
+use crate::session::exec_completion_ack;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -1691,6 +1692,9 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
+                // Acknowledgement happened inside `try_run_sampling_request`
+                // at server acceptance; later drain, cancellation, or abort
+                // requeues nothing.
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(err) => match err.details() {
@@ -2604,6 +2608,7 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
+    let mut exec_completion_accepted = false;
     let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
@@ -2660,6 +2665,18 @@ async fn try_run_sampling_request(
                 ));
             }
         };
+
+        // Server acceptance is the only acknowledgement point: the first
+        // event proving the server is producing this response acknowledges
+        // exactly the tracked leases whose fragments the submitted prompt
+        // contains. Nothing later -- stream error, EOF, cancellation, budget
+        // failure, tool drain, turn abort -- can un-acknowledge them:
+        // acknowledgement untracks the members and removes them from the
+        // mailbox, and failing an acknowledged lease is a no-op.
+        if !exec_completion_accepted && exec_completion_ack::is_acceptance_event(&event) {
+            exec_completion_accepted = true;
+            exec_completion_ack::acknowledge_submitted(&sess, &turn_context, &prompt.input).await;
+        }
 
         sess.services
             .session_telemetry

@@ -12,10 +12,15 @@
 //! goal continuation; suspended entries (retry exhausted) are excluded so they
 //! never block idle starts or suppress idle contributors.
 //!
-//! Sampling acknowledgement wiring (story D) is out of scope: idle wake
-//! leases entries via [`RuntimeMailbox::lease_available_up_to`] and hands the
-//! leases to the turn starter as the internal `TurnInput` variant, which the
-//! record path renders through the exec-completion context fragment.
+//! Idle wake leases entries via [`RuntimeMailbox::lease_available_up_to`] and
+//! hands the leases to the turn starter as the internal `TurnInput` variant,
+//! which the record path renders through the exec-completion context fragment.
+//! The sampling path acknowledges a lease only after a submitted prompt is
+//! observed to contain its fragment; a failed or aborted submission fails the
+//! lease back to unleased so a later wake retries it. Each failed attempt
+//! counts against [`MAX_RUNTIME_SAMPLING_ATTEMPTS`]; the attempt that exhausts
+//! the budget suspends the entry instead of re-offering it, so a persistently
+//! failing completion can neither spin wake turns nor wedge the mailbox.
 //!
 //! [iac]: codex_protocol::protocol::InterAgentCommunication
 
@@ -32,6 +37,15 @@ use crate::unified_exec::completion_receipt::ReceiptOwner;
 /// The wake preserves the thread's execution settings, invents no initiating
 /// agent, and resets no human quota.
 pub(crate) const EXEC_COMPLETION_TURN_TRIGGER: &str = "exec_completion";
+
+/// Maximum failed sampling attempts before a runtime entry is suspended.
+///
+/// One attempt is one wake turn that carried the entry without observing its
+/// fragment in a submitted prompt (failed or aborted submission, or omission
+/// from the prompt). In-turn transport retries are bounded separately and do
+/// not count here. The failing attempt that reaches this budget suspends the
+/// entry: it stays retained and visible but starts no further wake turns.
+pub(crate) const MAX_RUNTIME_SAMPLING_ATTEMPTS: u32 = 3;
 
 /// Opaque sampling lease for one runtime mailbox entry.
 ///
@@ -60,12 +74,15 @@ impl RuntimeLease {
 #[derive(Debug)]
 struct PendingRuntimeNotification {
     receipt_id: ReceiptId,
-    // Carries the B receipt owner for sampling-acknowledgement wiring (story D).
+    // Carries the B receipt owner for retained-output reads (story E).
     #[allow(dead_code)]
     owner: ReceiptOwner,
     completion: ExecCompletion,
     suspended: bool,
     lease: Option<Uuid>,
+    /// Failed sampling attempts so far; reaching
+    /// [`MAX_RUNTIME_SAMPLING_ATTEMPTS`] suspends the entry.
+    attempts: u32,
 }
 
 /// Mailbox-side lease tracking for runtime notifications.
@@ -106,6 +123,7 @@ impl RuntimeMailbox {
             completion,
             suspended: false,
             lease: None,
+            attempts: 0,
         });
         true
     }
@@ -161,12 +179,12 @@ impl RuntimeMailbox {
         leases
     }
 
-    /// Acknowledges a lease after its contents were sampled.
+    /// Acknowledges a lease after the server accepted a prompt containing its fragment.
     ///
     /// Removes the entry. Unknown receipts, stale tokens, and leases for
-    /// cancelled entries are refused. Production callers arrive with sampling
-    /// acknowledgement (story D); covered by tests until then.
-    #[allow(dead_code)]
+    /// cancelled entries are refused. Removal is what makes a later
+    /// [`Self::fail`] on the same lease a no-op: no downstream error path can
+    /// requeue an acknowledged lease.
     pub(crate) fn acknowledge(&mut self, lease: &RuntimeLease) -> bool {
         let Some(index) = self
             .entries
@@ -185,9 +203,11 @@ impl RuntimeMailbox {
     /// Returns a leased entry to the unleased state after a failed attempt.
     ///
     /// The next drain retries it with a fresh token. Stale tokens and unknown
-    /// receipts are refused without duplicating the entry. Production callers
-    /// arrive with sampling acknowledgement (story D); covered by tests until then.
-    #[allow(dead_code)]
+    /// receipts are refused without duplicating the entry and without counting
+    /// an attempt; in particular, failing an acknowledged lease is a no-op and
+    /// never requeues it. The attempt that reaches [`MAX_RUNTIME_SAMPLING_ATTEMPTS`]
+    /// suspends the entry instead: it stays retained but is excluded from
+    /// pending, trigger, and lease queries.
     pub(crate) fn fail(&mut self, lease: &RuntimeLease) -> bool {
         let Some(entry) = self
             .entries
@@ -200,7 +220,23 @@ impl RuntimeMailbox {
             return false;
         }
         entry.lease = None;
+        entry.attempts = entry.attempts.saturating_add(1);
+        let exhausted = entry.attempts >= MAX_RUNTIME_SAMPLING_ATTEMPTS;
+        let receipt_id = entry.receipt_id;
+        if exhausted {
+            self.suspend(receipt_id);
+        }
         true
+    }
+
+    /// Reports whether the entry is suspended (attempts exhausted).
+    ///
+    /// Unknown receipts report `false`. Callers use this after [`Self::fail`]
+    /// to warn visibly when an entry stops retrying.
+    pub(crate) fn is_suspended(&self, receipt_id: ReceiptId) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.receipt_id == receipt_id && entry.suspended)
     }
 
     /// Removes the entry whether leased or not.
@@ -224,9 +260,7 @@ impl RuntimeMailbox {
     /// Marks an entry suspended after retries are exhausted.
     ///
     /// Suspended entries are excluded from pending, trigger, and lease
-    /// queries until they are cancelled or acknowledged. Production callers
-    /// arrive with bounded sampling retries (story D); covered by tests until then.
-    #[allow(dead_code)]
+    /// queries until they are cancelled or acknowledged.
     pub(crate) fn suspend(&mut self, receipt_id: ReceiptId) -> bool {
         let Some(entry) = self
             .entries
