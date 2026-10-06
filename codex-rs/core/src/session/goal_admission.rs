@@ -27,7 +27,7 @@ pub(crate) fn check_goal_admission(
     kind: TurnStartKind,
     turn_trigger: Option<&str>,
 ) -> Option<NotSubmittedReason> {
-    if kind != TurnStartKind::Automatic || turn_trigger != Some("goal") {
+    if kind != TurnStartKind::Automatic {
         return None;
     }
     let checker = session
