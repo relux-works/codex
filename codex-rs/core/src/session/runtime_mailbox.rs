@@ -214,6 +214,7 @@ impl RuntimeMailbox {
             return false;
         };
         if entry.lease != Some(lease.token) {
+            entry.attempts = entry.attempts.saturating_add(1);
             return false;
         }
         entry.lease = None;
