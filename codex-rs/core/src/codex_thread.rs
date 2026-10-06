@@ -380,6 +380,23 @@ impl CodexThread {
         true
     }
 
+    /// Reports the idle-wake mailbox gates for testing: `(pending, trigger)`.
+    ///
+    /// Test-only: acknowledged entries report `(false, false)`, retained
+    /// entries `(true, true)`, and suspended entries `(false, false)`.
+    /// Suites using this probe stage no inter-agent mail, so both gates
+    /// reflect runtime notifications only.
+    #[doc(hidden)]
+    pub async fn test_runtime_notification_state(&self) -> (bool, bool) {
+        (
+            self.session.input_queue.has_pending_mailbox_items().await,
+            self.session
+                .input_queue
+                .has_trigger_turn_mailbox_items()
+                .await,
+        )
+    }
+
     async fn test_reserve_and_enqueue_exec_completion(&self) -> bool {
         use crate::context::ExecCompletion;
         use crate::context::ExecOutputRetention;
