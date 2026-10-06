@@ -66,6 +66,7 @@ use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::event_mapping::parse_turn_item;
 use crate::guardian::GuardianReviewContext;
 use crate::session::TurnInput;
+use crate::session::exec_completion_ack;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
@@ -775,10 +776,20 @@ pub(crate) async fn record_pending_input(
             sess.ensure_rollout_materialized(persist_context).await;
         }
         TurnInput::ExecCompletion(leases) => {
-            // Only the contextual items persist: no receipt metadata, so
-            // resume replays data without rearming anything.
+            // Recording is not acknowledgement: track the leases on the turn
+            // so the submit path can acknowledge exactly the fragments a
+            // submitted prompt contains. Only the contextual items persist: no
+            // receipt metadata, so resume replays data without rearming
+            // anything. A retry skips fragments already in history instead of
+            // appending them a second time.
+            exec_completion_ack::note_recorded(turn_context, &leases);
+            let history = sess.clone_history().await;
+            let history_items = history.raw_items().collect::<Vec<_>>();
             let items = leases
                 .iter()
+                .filter(|lease| {
+                    !exec_completion_ack::items_contain_lease(history_items.iter().copied(), lease)
+                })
                 .map(|lease| {
                     ContextualUserFragment::into(ExecCompletionFragment::new(
                         lease.receipt_id().model_handle(),
@@ -786,9 +797,11 @@ pub(crate) async fn record_pending_input(
                     ))
                 })
                 .collect::<Vec<_>>();
-            sess.record_conversation_items(turn_context, model_info, &items)
-                .await;
-            sess.ensure_rollout_materialized(persist_context).await;
+            if !items.is_empty() {
+                sess.record_conversation_items(turn_context, model_info, &items)
+                    .await;
+                sess.ensure_rollout_materialized(persist_context).await;
+            }
         }
     }
     record_additional_contexts(sess, turn_context, additional_contexts).await;

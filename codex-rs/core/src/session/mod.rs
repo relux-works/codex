@@ -231,6 +231,7 @@ mod code_mode_warning;
 pub(crate) mod context_window;
 mod daemon_recovery;
 mod environment;
+pub(crate) mod exec_completion_ack;
 mod extension_interruption;
 pub(crate) mod extension_metrics;
 mod guardian_checkpoint;

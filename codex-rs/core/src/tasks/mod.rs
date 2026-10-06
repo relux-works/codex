@@ -30,6 +30,7 @@ use crate::context::ContextualUserFragment;
 use crate::context::MAX_EXEC_COMPLETION_FRAGMENTS_PER_REQUEST;
 use crate::hook_runtime::run_turn_interrupt_hooks;
 use crate::session::TurnInput;
+use crate::session::exec_completion_ack;
 use crate::session::session::Session;
 use crate::session::turn::run_hooks_and_record_inputs;
 use crate::session::turn_context::NewTurnContextOptions;
@@ -559,7 +560,14 @@ impl Session {
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
         let mut turn_context = None;
+        let mut dropped_leases = Vec::new();
         if let Some(mut active_turn) = self.take_active_turn(&reason).await {
+            // Leases that never reached the record path must fail rather than
+            // drop with the turn, or their entries stay leased forever.
+            dropped_leases = self
+                .input_queue
+                .take_pending_exec_completion_leases(&active_turn)
+                .await;
             let task = active_turn.task.take();
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -586,6 +594,7 @@ impl Session {
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
             self.input_queue.clear_pending(&active_turn).await;
         }
+        exec_completion_ack::fail_leases(self, turn_context.as_deref(), &dropped_leases).await;
         if reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
         }
@@ -629,6 +638,12 @@ impl Session {
         reason: TurnAbortReason,
         error: Option<ErrorEvent>,
     ) {
+        // Leases that never reached the record path must fail rather than
+        // drop with the turn, or their entries stay leased forever.
+        let dropped_leases = self
+            .input_queue
+            .take_pending_exec_completion_leases(&active_turn)
+            .await;
         let task = active_turn.task.take();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
@@ -642,6 +657,7 @@ impl Session {
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
         self.input_queue.clear_pending(&active_turn).await;
+        exec_completion_ack::fail_leases(self, turn_context.as_deref(), &dropped_leases).await;
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
@@ -716,6 +732,11 @@ impl Session {
             PersistContext::Standard,
         )
         .await;
+        // Leases recorded but never observed in a submitted prompt return to
+        // unleased so a later wake retries them; entries that exhaust their
+        // sampling budget suspend visibly instead of spinning further wakes.
+        // This must precede the idle wake below so retries are re-offered.
+        exec_completion_ack::fail_unsubmitted(self, &turn_context).await;
         let turn_telemetry = &turn_context.session_telemetry;
         // Emit token usage metrics.
         {
@@ -1026,6 +1047,9 @@ impl Session {
                 turn_id: task.turn_context.sub_id.clone(),
                 profile,
             });
+        // An aborted submission is not a sampling proof: recorded leases
+        // return to unleased so the post-abort wake can retry them.
+        exec_completion_ack::fail_unsubmitted(self, &task.turn_context).await;
         let event = EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: Some(task.turn_context.sub_id.clone()),
             reason,
