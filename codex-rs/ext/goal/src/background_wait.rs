@@ -287,7 +287,6 @@ impl BackgroundWaitState {
             generation: state.generation,
             issued_at: now,
         };
-        state.next_ticket_id += 1;
         state.outstanding_ticket = Some(ticket.clone());
         state.admission_attempt = Some(AdmissionAttempt {
             goal_id: goal_id.to_string(),
