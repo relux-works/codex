@@ -64,7 +64,7 @@ pub(crate) fn build_snapshot(
 ) -> PendingWorkSnapshot {
     let suspended: HashSet<ReceiptId> = mailbox_entries
         .iter()
-        .filter(|entry| entry.suspended)
+        .filter(|entry| entry.suspended && entry.leased)
         .map(|entry| entry.receipt_id)
         .collect();
     let mut states: HashMap<ReceiptId, PendingState> = HashMap::new();
@@ -84,7 +84,7 @@ pub(crate) fn build_snapshot(
         states.insert(receipt_id, PendingState::Leased);
     }
     for entry in mailbox_entries {
-        if entry.suspended {
+        if entry.suspended && entry.leased {
             states.remove(&entry.receipt_id);
             continue;
         }
