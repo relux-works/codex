@@ -10,8 +10,11 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use codex_protocol::ThreadId;
 use thiserror::Error;
@@ -173,6 +176,16 @@ pub(crate) enum ReceiptError {
     IdGenerationFailed,
     #[error("completion receipt lock was poisoned by a panic")]
     LockPoisoned,
+    #[error("completion receipt lock is contended")]
+    LockContended,
+}
+
+/// Pending receipt ids by state, read under one lock.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingReceiptLists {
+    pub(crate) armed: Vec<ReceiptId>,
+    pub(crate) queued: Vec<ReceiptId>,
+    pub(crate) leased: Vec<ReceiptId>,
 }
 
 /// A sampling claim. Its fields are private so a caller cannot mint a lease.
@@ -199,6 +212,7 @@ impl SamplingLease {
 #[derive(Default)]
 pub(crate) struct CompletionReceiptStore {
     state: Mutex<StoreState>,
+    revision: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -306,6 +320,49 @@ impl CompletionReceiptStore {
         self.state.lock().map_err(|_| ReceiptError::LockPoisoned)
     }
 
+    /// Creates a store sharing the given pending-work revision.
+    pub(crate) fn with_revision(revision: Arc<AtomicU64>) -> Self {
+        Self {
+            state: Mutex::new(StoreState::default()),
+            revision,
+        }
+    }
+
+    /// Returns the current pending-work revision.
+    #[cfg(test)]
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    fn bump_revision(&self) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Lists pending receipt ids by state under one lock.
+    ///
+    /// Uses a non-blocking lock so snapshot readers fail with an explicit
+    /// error instead of stalling a turn. Armed, Queued, and LeasedToSampling
+    /// are read atomically: a receipt appears in exactly one list.
+    pub(crate) fn try_list_pending(&self) -> Result<PendingReceiptLists, ReceiptError> {
+        let state = self.state.try_lock().map_err(|err| match err {
+            std::sync::TryLockError::Poisoned(_) => ReceiptError::LockPoisoned,
+            std::sync::TryLockError::WouldBlock => ReceiptError::LockContended,
+        })?;
+        let mut lists = PendingReceiptLists::default();
+        for (receipt_id, record) in &state.active {
+            match &record.phase {
+                ReceiptPhase::Armed => lists.armed.push(*receipt_id),
+                ReceiptPhase::Queued(_) => lists.queued.push(*receipt_id),
+                ReceiptPhase::LeasedToSampling { .. } => lists.leased.push(*receipt_id),
+                ReceiptPhase::Reserved { .. }
+                | ReceiptPhase::InlineResult
+                | ReceiptPhase::Sampled { .. }
+                | ReceiptPhase::Cancelled(_) => {}
+            }
+        }
+        Ok(lists)
+    }
+
     /// Reserves capacity before the caller launches an opted-in process.
     pub(crate) fn reserve(&self, owner: ReceiptOwner) -> Result<ReceiptId, ReceiptError> {
         let mut state = self.lock_state()?;
@@ -331,6 +388,7 @@ impl CompletionReceiptStore {
                 phase: ReceiptPhase::Reserved { completion: None },
             },
         );
+        self.bump_revision();
         Ok(receipt_id)
     }
 
@@ -383,28 +441,30 @@ impl CompletionReceiptStore {
             None => return Err(state.terminal_error(receipt_id, owner)),
         };
 
-        match action {
+        let outcome = match action {
             Action::Inline(completion) => {
                 state.retire(receipt_id, ReceiptPhase::InlineResult)?;
-                Ok(InitialResponseOutcome::InlineResult(completion))
+                InitialResponseOutcome::InlineResult(completion)
             }
             Action::Armed => {
                 if let Some(record) = state.active.get_mut(&receipt_id) {
                     record.phase = ReceiptPhase::Armed;
-                    Ok(InitialResponseOutcome::Armed)
+                    InitialResponseOutcome::Armed
                 } else {
-                    Err(ReceiptError::UnknownReceipt)
+                    return Err(ReceiptError::UnknownReceipt);
                 }
             }
             Action::Queued(completion) => {
                 if let Some(record) = state.active.get_mut(&receipt_id) {
                     record.phase = ReceiptPhase::Queued(completion);
-                    Ok(InitialResponseOutcome::Queued)
+                    InitialResponseOutcome::Queued
                 } else {
-                    Err(ReceiptError::UnknownReceipt)
+                    return Err(ReceiptError::UnknownReceipt);
                 }
             }
-        }
+        };
+        self.bump_revision();
+        Ok(outcome)
     }
 
     /// Publishes a fully finalized exit, retaining it if the response is undecided.
@@ -421,19 +481,23 @@ impl CompletionReceiptStore {
             None => return Err(state.terminal_error(receipt_id, owner)),
         };
 
-        match &mut record.phase {
+        let outcome = match &mut record.phase {
             ReceiptPhase::Reserved { completion: stored } if stored.is_none() => {
                 *stored = Some(completion);
-                Ok(ExitPublicationOutcome::RetainedUntilDecision)
+                ExitPublicationOutcome::RetainedUntilDecision
             }
             ReceiptPhase::Armed => {
                 record.phase = ReceiptPhase::Queued(completion);
-                Ok(ExitPublicationOutcome::Queued)
+                ExitPublicationOutcome::Queued
             }
-            phase => Err(ReceiptError::InvalidTransition {
-                actual: phase.status(),
-            }),
-        }
+            phase => {
+                return Err(ReceiptError::InvalidTransition {
+                    actual: phase.status(),
+                });
+            }
+        };
+        self.bump_revision();
+        Ok(outcome)
     }
 
     /// Leases the single queued claim to either the pushed or terminal-stdin path.
@@ -450,7 +514,7 @@ impl CompletionReceiptStore {
             None => return Err(state.terminal_error(receipt_id, owner)),
         };
 
-        match &record.phase {
+        let lease = match &record.phase {
             ReceiptPhase::Queued(completion) => {
                 let completion = *completion;
                 let token = Uuid::new_v4();
@@ -459,18 +523,22 @@ impl CompletionReceiptStore {
                     token,
                     source,
                 };
-                Ok(SamplingLease {
+                SamplingLease {
                     receipt_id,
                     owner: owner.clone(),
                     token,
                     source,
-                })
+                }
             }
-            ReceiptPhase::LeasedToSampling { .. } => Err(ReceiptError::AlreadyLeased),
-            phase => Err(ReceiptError::InvalidTransition {
-                actual: phase.status(),
-            }),
-        }
+            ReceiptPhase::LeasedToSampling { .. } => return Err(ReceiptError::AlreadyLeased),
+            phase => {
+                return Err(ReceiptError::InvalidTransition {
+                    actual: phase.status(),
+                });
+            }
+        };
+        self.bump_revision();
+        Ok(lease)
     }
 
     /// A failed sampling attempt requeues the same receipt without another claim.
@@ -490,10 +558,11 @@ impl CompletionReceiptStore {
             } if *token == lease.token && *source == lease.source => {
                 let completion = *completion;
                 record.phase = ReceiptPhase::Queued(completion);
-                Ok(())
             }
-            _ => Err(ReceiptError::StaleLease),
+            _ => return Err(ReceiptError::StaleLease),
         }
+        self.bump_revision();
+        Ok(())
     }
 
     /// Acknowledges the claim only after its contents were included in sampling.
@@ -521,6 +590,7 @@ impl CompletionReceiptStore {
                 source: lease.source,
             },
         )?;
+        self.bump_revision();
         Ok(completion)
     }
 
@@ -544,7 +614,9 @@ impl CompletionReceiptStore {
             }
         }
 
-        state.retire(receipt_id, ReceiptPhase::Cancelled(reason))
+        state.retire(receipt_id, ReceiptPhase::Cancelled(reason))?;
+        self.bump_revision();
+        Ok(())
     }
 
     /// Returns the number of receipts currently holding an active slot.
@@ -554,6 +626,16 @@ impl CompletionReceiptStore {
     /// sampled receipts with retained output on top to size combined capacity.
     pub(crate) fn active_len(&self) -> Result<usize, ReceiptError> {
         Ok(self.lock_state()?.active.len())
+    }
+
+    /// Holds the store lock while running `f`, for contended-read tests.
+    #[cfg(test)]
+    pub(crate) fn test_with_held_lock<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f()
     }
 
     /// Returns the current state for the matching owner, including recent outcomes.
