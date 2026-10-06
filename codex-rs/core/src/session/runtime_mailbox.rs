@@ -26,6 +26,7 @@
 
 use std::collections::VecDeque;
 
+use codex_protocol::ThreadId;
 use uuid::Uuid;
 
 use crate::context::ExecCompletion;
@@ -214,7 +215,16 @@ impl RuntimeMailbox {
             .iter_mut()
             .find(|entry| entry.receipt_id == lease.receipt_id)
         else {
-            return false;
+            let owner = ReceiptOwner::new(ThreadId::new(), 0, "mutant").expect("mutant owner");
+            self.entries.push_back(PendingRuntimeNotification {
+                receipt_id: lease.receipt_id,
+                owner,
+                completion: lease.completion.clone(),
+                suspended: false,
+                lease: None,
+                attempts: 0,
+            });
+            return true;
         };
         if entry.lease != Some(lease.token) {
             return false;
