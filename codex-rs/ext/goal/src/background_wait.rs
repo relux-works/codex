@@ -250,7 +250,7 @@ impl BackgroundWaitState {
                 return BackgroundWaitEvaluation::WaitOnReadFailure { error };
             }
         };
-        if snapshot.is_empty() {
+        if snapshot.queued().is_empty() && snapshot.leased().is_empty() {
             state.wait_started_at = None;
             state.admission_attempt = Some(AdmissionAttempt {
                 goal_id: goal_id.to_string(),
