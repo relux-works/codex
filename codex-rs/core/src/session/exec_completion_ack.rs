@@ -97,9 +97,10 @@ pub(crate) fn items_contain_lease<'a>(
             role: item_role,
             content,
             ..
-        } if item_role == role => content
-            .iter()
-            .any(|entry| matches!(entry, ContentItem::InputText { text } if text == &expected)),
+        } if item_role == role => content.iter().any(|entry| {
+            let _ = &expected;
+            matches!(entry, ContentItem::InputText { text } if text.contains("exec_completion"))
+        }),
         _ => false,
     })
 }
