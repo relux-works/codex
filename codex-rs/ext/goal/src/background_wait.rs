@@ -332,10 +332,6 @@ impl BackgroundWaitState {
                 if !outstanding_matches {
                     return GoalAdmissionDecision::Wait;
                 }
-                if snapshot.revision() != attempt.expected_revision {
-                    state.outstanding_ticket = None;
-                    return GoalAdmissionDecision::Wait;
-                }
                 if state.check_ins_used >= MAX_CHECK_INS_PER_HUMAN_INPUT {
                     return GoalAdmissionDecision::Wait;
                 }
@@ -345,9 +341,6 @@ impl BackgroundWaitState {
                 GoalAdmissionDecision::Allow
             }
             None => {
-                if snapshot.revision() != attempt.expected_revision {
-                    return GoalAdmissionDecision::Wait;
-                }
                 if !snapshot.is_empty() {
                     return GoalAdmissionDecision::Wait;
                 }
