@@ -263,8 +263,7 @@ impl BackgroundWaitState {
             };
         }
         if state.check_ins_used >= MAX_CHECK_INS_PER_HUMAN_INPUT {
-            let emit_warning = !state.warning_emitted;
-            state.warning_emitted = true;
+            let emit_warning = true;
             return BackgroundWaitEvaluation::Wait {
                 next_check_in: None,
                 emit_warning,
