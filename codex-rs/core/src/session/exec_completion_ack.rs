@@ -148,6 +148,9 @@ pub(crate) async fn acknowledge_submitted(
     turn_context: &TurnContext,
     prompt_input: &[ResponseItem],
 ) {
+    if turn_context.config.model_provider.supports_websockets {
+        return;
+    }
     let Some(tracked) = turn_context
         .extension_data
         .get::<PendingExecCompletionAcks>()
