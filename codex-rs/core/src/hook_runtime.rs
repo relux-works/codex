@@ -783,6 +783,9 @@ pub(crate) async fn record_pending_input(
             // anything. A retry skips fragments already in history instead of
             // appending them a second time.
             exec_completion_ack::note_recorded(turn_context, &leases);
+            for lease in &leases {
+                sess.input_queue.acknowledge_runtime_lease(lease).await;
+            }
             let history = sess.clone_history().await;
             let history_items = history.raw_items().collect::<Vec<_>>();
             let items = leases
