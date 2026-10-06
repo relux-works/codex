@@ -184,11 +184,6 @@ pub(crate) async fn acknowledge_submitted(
         if !sess.input_queue.acknowledge_runtime_lease(lease).await {
             continue;
         }
-        let manager = &sess.services.unified_exec_manager;
-        if let Ok(store_lease) = manager.lease_pushed_completion(lease.receipt_id(), lease.owner())
-        {
-            let _ = manager.acknowledge_pushed_completion(&store_lease).await;
-        }
     }
     tracked
         .leases
