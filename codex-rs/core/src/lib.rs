@@ -50,6 +50,8 @@ pub use codex_thread::CodexThreadSettingsOverrides;
 pub use codex_thread::GuardianAuthorizationVersion;
 pub use codex_thread::GuardianRootMessage;
 pub use codex_thread::GuardianRootSnapshot;
+#[doc(hidden)]
+pub use codex_thread::TestWakeLeaseGate;
 pub use codex_thread::ThreadConfigSnapshot;
 pub use session::turn_context::TurnContext;
 pub use thread_startup_metadata::ThreadStartupMetadata;

@@ -21,6 +21,7 @@ use super::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
+use crate::tasks::TurnStartClaim;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
 use codex_history::UserInputOrigin;
@@ -511,7 +512,12 @@ async fn start_if_idle(
         }
     }
     session
-        .start_task(turn_context, task_input, RegularTask::new())
+        .start_task(
+            turn_context,
+            task_input,
+            RegularTask::new(),
+            TurnStartClaim::AnyVacancy,
+        )
         .await;
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,

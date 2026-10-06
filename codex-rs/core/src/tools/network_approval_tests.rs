@@ -31,6 +31,7 @@ async fn execution_cancellation_respects_network_approval_boundary(
 ) {
     use crate::session::tests::make_session_and_context_with_rx;
     use crate::tasks::SessionTask;
+    use crate::tasks::TurnStartClaim;
 
     struct PendingTask;
     impl SessionTask for PendingTask {
@@ -70,7 +71,9 @@ async fn execution_cancellation_respects_network_approval_boundary(
         )
         .await
         .unwrap();
-    session.start_task(turn, Vec::new(), PendingTask).await;
+    session
+        .start_task(turn, Vec::new(), PendingTask, TurnStartClaim::AnyVacancy)
+        .await;
     let service = &session.services.network_approval;
     register_call_with_default_shell_trigger(service, "execution-1").await;
     let request = NetworkPolicyRequest {
