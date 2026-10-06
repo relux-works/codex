@@ -191,7 +191,7 @@ pub fn read_pending_work(
     thread_store: &ExtensionData,
 ) -> Result<PendingWorkSnapshot, PendingWorkReadError> {
     let Some(provider) = thread_store.get::<PendingWorkProvider>() else {
-        return Err(PendingWorkReadError::ProviderMissing);
+        return Ok(PendingWorkSnapshot::empty(0));
     };
     provider.read()
 }
