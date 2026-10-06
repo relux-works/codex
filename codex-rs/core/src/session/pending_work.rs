@@ -81,12 +81,6 @@ pub(crate) fn build_snapshot(
     for receipt_id in store_lists.armed {
         states.insert(receipt_id, PendingState::Armed);
     }
-    for receipt_id in store_lists.queued {
-        if suspended.contains(&receipt_id) {
-            continue;
-        }
-        states.insert(receipt_id, PendingState::Queued);
-    }
     for receipt_id in store_lists.leased {
         if suspended.contains(&receipt_id) {
             continue;
