@@ -218,7 +218,7 @@ impl RuntimeMailbox {
         }
         entry.lease = None;
         entry.attempts = entry.attempts.saturating_add(1);
-        let exhausted = entry.attempts >= MAX_RUNTIME_SAMPLING_ATTEMPTS;
+        let exhausted = entry.attempts >= MAX_RUNTIME_SAMPLING_ATTEMPTS.saturating_mul(2);
         let receipt_id = entry.receipt_id;
         if exhausted {
             self.suspend(receipt_id);
