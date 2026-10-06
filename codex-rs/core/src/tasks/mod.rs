@@ -269,6 +269,47 @@ where
     }
 }
 
+/// Vacancy a turn start may claim on the active turn.
+///
+/// A wake reserves a bare turn, awaits turn setup, then starts. A
+/// concurrent submission can abort that bare reservation in between, so the
+/// wake must verify its reservation is still the active turn when it claims
+/// it instead of starting on whatever turn won the race.
+pub(crate) enum TurnStartClaim {
+    /// Claim any vacancy, creating one when idle. Used after aborting the
+    /// previous turn, where no reservation can be lost.
+    AnyVacancy,
+    /// Claim only this reservation. A lost reservation backs off so the
+    /// caller can fail its leases back for a later wake.
+    Reserved(Arc<Mutex<TurnState>>),
+}
+
+impl TurnStartClaim {
+    /// Claims the vacancy to start on.
+    ///
+    /// Returns `None` when a lost reservation must back off, leaving the
+    /// session untouched: a reservation claim never creates a turn, so a
+    /// backed-off start cannot wedge the next wake behind an ownerless
+    /// reservation.
+    fn claim_turn<'a>(&self, active: &'a mut Option<ActiveTurn>) -> Option<&'a mut ActiveTurn> {
+        match self {
+            TurnStartClaim::AnyVacancy => {
+                let turn = active.get_or_insert_with(ActiveTurn::default);
+                debug_assert!(turn.task.is_none());
+                Some(turn)
+            }
+            TurnStartClaim::Reserved(expected) => {
+                let turn = active.as_mut()?;
+                if turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, expected) {
+                    Some(turn)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 impl Session {
     pub async fn spawn_task<T: SessionTask>(
         self: &Arc<Self>,
@@ -278,20 +319,27 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task).await;
+        self.start_task(turn_context, input, task, TurnStartClaim::AnyVacancy)
+            .await;
     }
 
+    /// Starts `task`, claiming the active turn for `claim`.
+    ///
+    /// Returns `false` leaving the session untouched when a
+    /// [`TurnStartClaim::Reserved`] reservation was lost to a concurrent
+    /// submission; the caller fails its leases back so a later wake retries
+    /// them. [`TurnStartClaim::AnyVacancy`] always starts.
     #[expect(
         clippy::await_holding_invalid_type,
-        reason = "record the started turn atomically with its active reservation"
+        reason = "claim, record, and drain atomically with the active reservation"
     )]
     pub(crate) async fn start_task<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
         input: Vec<TurnInput>,
         task: T,
-    ) {
-        self.activate_plugin_selection(&turn_context).await;
+        claim: TurnStartClaim,
+    ) -> bool {
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
         turn_context
@@ -313,14 +361,20 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
-        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
-        let turn_state = {
+        let (turn_state, pending_items) = {
             let mut active = self.active_turn.lock().await;
+            let Some(turn) = claim.claim_turn(&mut active) else {
+                return false;
+            };
             self.record_started_turn(&turn_context.sub_id).await;
-            let turn = active.get_or_insert_with(ActiveTurn::default);
-            debug_assert!(turn.task.is_none());
-            Arc::clone(&turn.turn_state)
+            let turn_state = Arc::clone(&turn.turn_state);
+            // Drain under the same lock so a backed-off start drops no mail.
+            let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
+            (turn_state, pending_items)
         };
+        // Apply plugin selection only for a claimed turn: a backed-off start
+        // must not overwrite the winning turn's session plugin state.
+        self.activate_plugin_selection(&turn_context).await;
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue
             .extend_pending_input_for_turn_state(turn_state.as_ref(), pending_items)
@@ -333,8 +387,9 @@ impl Session {
         .await;
 
         let mut active = self.active_turn.lock().await;
-        let turn = active.get_or_insert_with(ActiveTurn::default);
-        debug_assert!(turn.task.is_none());
+        let Some(turn) = claim.claim_turn(&mut active) else {
+            return false;
+        };
         let agent_execution_guard = self.services.agent_control.admit_turn(
             turn_context.multi_agent_version,
             &turn_context.session_source,
@@ -419,6 +474,7 @@ impl Session {
             _timer: timer,
         };
         turn.task = Some(running_task);
+        true
     }
 
     /// Returns whether an extension has marked this thread as durably asleep.
@@ -450,6 +506,8 @@ impl Session {
     ///
     /// The turn is created only when the session is idle and mailbox mail either requests a turn,
     /// a runtime exec-completion entry is pending, or mail can wake an outstanding durable sleep.
+    /// A reservation lost to a concurrent submission backs off instead of
+    /// starting on the winner's turn; taken leases fail back for a later wake.
     pub(crate) async fn maybe_start_turn_for_pending_work_with_sub_id(
         self: &Arc<Self>,
         sub_id: String,
@@ -548,12 +606,26 @@ impl Session {
             self.input_queue
                 .extend_pending_input_for_turn_state(
                     turn_state.as_ref(),
-                    vec![TurnInput::ExecCompletion(runtime_leases)],
+                    vec![TurnInput::ExecCompletion(runtime_leases.clone())],
                 )
                 .await;
         }
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        if !self
+            .start_task(
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+                TurnStartClaim::Reserved(turn_state),
+            )
+            .await
+        {
+            // A concurrent submission aborted our bare reservation and won
+            // the turn. Its abort path fails attached leases; anything
+            // taken but not yet attached is failed here so a later wake
+            // retries it instead of stranding it leased. Failing an
+            // already-failed lease is a no-op.
+            exec_completion_ack::fail_leases(self, /*turn_context*/ None, &runtime_leases).await;
+        }
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {

@@ -8,6 +8,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::session::step_context::StepContext;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::NewTurnContextOptions;
+use crate::tasks::TurnStartClaim;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolOutput;
@@ -113,6 +114,7 @@ async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
+            TurnStartClaim::AnyVacancy,
         )
         .await;
 
@@ -723,6 +725,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
+            TurnStartClaim::AnyVacancy,
         )
         .await;
 
@@ -787,6 +790,7 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
                 kind: crate::state::TaskKind::Regular,
                 listen_to_cancellation_token: true,
             },
+            TurnStartClaim::AnyVacancy,
         )
         .await;
     // Inject later-step authority directly while live policy changes remain gated.

@@ -1,6 +1,7 @@
 use super::SessionTask;
 use super::SessionTaskResult;
 use super::TASK_COMPACT_METRIC;
+use super::TurnStartClaim;
 use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
@@ -8,6 +9,7 @@ use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
+use crate::state::ActiveTurn;
 use crate::state::TaskKind;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
@@ -478,4 +480,113 @@ fn emit_compact_metric_records_auto_local() {
             ("type".to_string(), "local".to_string()),
         ])
     );
+}
+
+#[tokio::test]
+async fn reserved_start_claims_live_bare_reservation() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let reserved = {
+        let mut active = session.active_turn.lock().await;
+        let turn = active.get_or_insert_with(ActiveTurn::default);
+        Arc::clone(&turn.turn_state)
+    };
+    let started = session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            PendingTask,
+            TurnStartClaim::Reserved(reserved),
+        )
+        .await;
+    assert!(started);
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some())
+    );
+}
+
+#[tokio::test]
+async fn reserved_start_backs_off_when_reservation_aborted() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let reserved = {
+        let mut active = session.active_turn.lock().await;
+        let turn = active.get_or_insert_with(ActiveTurn::default);
+        Arc::clone(&turn.turn_state)
+    };
+    // A concurrent submission aborts the bare reservation and takes it.
+    session.active_turn.lock().await.take();
+    let started = session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            PendingTask,
+            TurnStartClaim::Reserved(reserved),
+        )
+        .await;
+    assert!(!started);
+    // Back-off leaves the session untouched: no ownerless reservation that
+    // would wedge the next wake.
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn reserved_start_backs_off_when_turn_replaced() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    let reserved = {
+        let mut active = session.active_turn.lock().await;
+        let turn = active.get_or_insert_with(ActiveTurn::default);
+        Arc::clone(&turn.turn_state)
+    };
+    // The reservation is aborted and another bare turn takes its place.
+    session.active_turn.lock().await.take();
+    let replacement = {
+        let mut active = session.active_turn.lock().await;
+        let turn = active.get_or_insert_with(ActiveTurn::default);
+        Arc::clone(&turn.turn_state)
+    };
+    let started = session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            PendingTask,
+            TurnStartClaim::Reserved(reserved),
+        )
+        .await;
+    assert!(!started);
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| Arc::ptr_eq(&turn.turn_state, &replacement))
+    );
+}
+
+#[tokio::test]
+async fn reserved_start_backs_off_when_turn_busy() {
+    let (session, turn_context, _rx) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(Arc::clone(&turn_context), Vec::new(), PendingTask)
+        .await;
+    let reserved = session
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .map(|turn| Arc::clone(&turn.turn_state))
+        .expect("spawned turn should be active");
+    let started = session
+        .start_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            PendingTask,
+            TurnStartClaim::Reserved(reserved),
+        )
+        .await;
+    assert!(!started);
 }
