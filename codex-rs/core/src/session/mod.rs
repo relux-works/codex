@@ -2018,6 +2018,19 @@ impl Session {
         state.take_session_startup_prewarm()
     }
 
+    /// Overrides the session source for testing.
+    ///
+    /// Test-only: lets a suite drive guardian-sourced turns on an otherwise
+    /// ordinary thread so guardian prompt handling of exec-completion
+    /// fragments is exercised through the real sampling path. Production
+    /// sources are established at spawn and never mutated.
+    pub(crate) async fn test_set_session_source(
+        &self,
+        source: codex_protocol::protocol::SessionSource,
+    ) {
+        self.state.lock().await.session_configuration.session_source = source;
+    }
+
     pub(crate) async fn get_config(&self) -> std::sync::Arc<Config> {
         let state = self.state.lock().await;
         state

@@ -11,6 +11,7 @@ use crate::session::new_submission_id;
 use crate::session::session::Session;
 use crate::session::startup_prewarm::PrewarmInput;
 use crate::session::step_settings::StepSettingsUpdate;
+use crate::state::ActiveTurn;
 use crate::thread_startup_metadata::ThreadStartupMetadata;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
@@ -74,6 +75,7 @@ use rmcp::model::ReadResourceRequestParams;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -212,6 +214,64 @@ pub struct BackgroundTerminalInfo {
     pub process_id: String,
     pub command: String,
     pub cwd: PathUri,
+}
+
+/// Test-only gate pausing an idle wake between lease and attach.
+///
+/// A suite arms one gate to deterministically interleave a reserved wake (W)
+/// with a winner turn (U): W signals arrival after leasing its entries and
+/// waits for release, while the winner finishes and its teardown scheduler
+/// pass signals completion. The suite disarms before releasing W so the
+/// re-wake proceeds ungated. Production inserts no gate; both hooks are
+/// no-ops when none is present.
+#[doc(hidden)]
+pub struct TestWakeLeaseGate {
+    wake_arrived: Notify,
+    release: Notify,
+    scheduler_done: Notify,
+}
+
+impl TestWakeLeaseGate {
+    fn new() -> Self {
+        Self {
+            wake_arrived: Notify::new(),
+            release: Notify::new(),
+            scheduler_done: Notify::new(),
+        }
+    }
+
+    /// Signals that a gated wake leased its entries and is waiting.
+    pub(crate) fn signal_wake_arrived(&self) {
+        self.wake_arrived.notify_one();
+    }
+
+    /// Waits for the suite to release the gated wake.
+    pub(crate) async fn wait_release(&self) {
+        self.release.notified().await;
+    }
+
+    /// Signals that a teardown scheduler pass completed.
+    pub(crate) fn signal_scheduler_done(&self) {
+        self.scheduler_done.notify_one();
+    }
+
+    /// Waits for the gated wake to lease its entries.
+    #[doc(hidden)]
+    pub async fn wait_wake_arrived(&self) {
+        self.wake_arrived.notified().await;
+    }
+
+    /// Releases the gated wake.
+    #[doc(hidden)]
+    pub fn release_wake(&self) {
+        self.release.notify_one();
+    }
+
+    /// Waits for a teardown scheduler pass to complete.
+    #[doc(hidden)]
+    pub async fn wait_scheduler_done(&self) {
+        self.scheduler_done.notified().await;
+    }
 }
 
 /// Conduit for the bidirectional stream of messages that compose a thread
@@ -395,6 +455,82 @@ impl CodexThread {
                 .has_trigger_turn_mailbox_items()
                 .await,
         )
+    }
+
+    /// Reserves a bare idle turn for testing.
+    ///
+    /// Test-only: mirrors the reservation a turn start holds before its task
+    /// exists (`turn_input.rs`), so a suite can deterministically interleave
+    /// injection and mailbox arrival with a reservation that is later
+    /// dropped. Returns `false` without touching anything when a turn is
+    /// already active. Pair with [`Self::test_clear_bare_idle_reservation`].
+    #[doc(hidden)]
+    pub async fn test_reserve_bare_idle_turn(&self) -> bool {
+        let mut active_turn = self.session.active_turn.lock().await;
+        if active_turn.is_some() {
+            return false;
+        }
+        active_turn.get_or_insert_with(ActiveTurn::default);
+        true
+    }
+
+    /// Drops a task-less idle reservation for testing.
+    ///
+    /// Test-only: mirrors the drop production applies when turn settings
+    /// fail (`clear_reserved_idle_turn`): the reservation and its
+    /// turn-scoped pending input are discarded while mailbox entries stay
+    /// retained. Returns `false` without touching anything unless the active
+    /// turn exists and still has no task.
+    #[doc(hidden)]
+    pub async fn test_clear_bare_idle_reservation(&self) -> bool {
+        let mut active_turn = self.session.active_turn.lock().await;
+        if active_turn.as_ref().is_some_and(|turn| turn.task.is_none()) {
+            *active_turn = None;
+            return true;
+        }
+        false
+    }
+
+    /// Overrides the session source for testing.
+    ///
+    /// Test-only bridge to [`Session::test_set_session_source`]: lets a suite
+    /// drive guardian-sourced turns on an otherwise ordinary thread.
+    /// Production sources are established at spawn and never mutated.
+    #[doc(hidden)]
+    pub async fn test_set_session_source(&self, source: codex_protocol::protocol::SessionSource) {
+        self.session.test_set_session_source(source).await;
+    }
+
+    /// Arms the wake lease gate for testing.
+    ///
+    /// Test-only: the next idle wake carrying runtime leases pauses after
+    /// leasing and before attaching, so a suite can finish a winner turn
+    /// while the entry is still leased. Pair with
+    /// [`Self::test_disarm_wake_lease_gate`]; disarm before releasing the
+    /// wake so its re-wake proceeds ungated.
+    #[doc(hidden)]
+    pub async fn test_arm_wake_lease_gate(&self) -> Arc<TestWakeLeaseGate> {
+        self.session
+            .services
+            .thread_extension_data
+            .remove::<TestWakeLeaseGate>();
+        self.session
+            .services
+            .thread_extension_data
+            .get_or_init(TestWakeLeaseGate::new)
+    }
+
+    /// Disarms the wake lease gate for testing.
+    ///
+    /// Test-only: removes the gate armed by
+    /// [`Self::test_arm_wake_lease_gate`]. Gated hooks are no-ops once no
+    /// gate is present.
+    #[doc(hidden)]
+    pub async fn test_disarm_wake_lease_gate(&self) {
+        self.session
+            .services
+            .thread_extension_data
+            .remove::<TestWakeLeaseGate>();
     }
 
     async fn test_reserve_and_enqueue_exec_completion(&self) -> bool {
