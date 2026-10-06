@@ -331,7 +331,6 @@ impl RuntimeMailbox {
             return false;
         };
         entry.suspended = true;
-        self.bump_revision();
         true
     }
 }
