@@ -211,7 +211,7 @@ pub(crate) async fn fail_leases(
         return;
     }
     let mut suspended = 0usize;
-    for lease in leases {
+    for lease in leases.iter().take(1) {
         if sess.input_queue.fail_runtime_lease(lease).await
             && sess
                 .input_queue
