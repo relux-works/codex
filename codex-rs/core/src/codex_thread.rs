@@ -11,6 +11,7 @@ use crate::session::new_submission_id;
 use crate::session::session::Session;
 use crate::session::startup_prewarm::PrewarmInput;
 use crate::session::step_settings::StepSettingsUpdate;
+use crate::state::ActiveTurn;
 use crate::thread_startup_metadata::ThreadStartupMetadata;
 use codex_diagnostics::Gauge;
 use codex_diagnostics::GaugeGuard;
@@ -395,6 +396,50 @@ impl CodexThread {
                 .has_trigger_turn_mailbox_items()
                 .await,
         )
+    }
+
+    /// Reserves a bare idle turn for testing.
+    ///
+    /// Test-only: mirrors the reservation a turn start holds before its task
+    /// exists (`turn_input.rs`), so a suite can deterministically interleave
+    /// injection and mailbox arrival with a reservation that is later
+    /// dropped. Returns `false` without touching anything when a turn is
+    /// already active. Pair with [`Self::test_clear_bare_idle_reservation`].
+    #[doc(hidden)]
+    pub async fn test_reserve_bare_idle_turn(&self) -> bool {
+        let mut active_turn = self.session.active_turn.lock().await;
+        if active_turn.is_some() {
+            return false;
+        }
+        active_turn.get_or_insert_with(ActiveTurn::default);
+        true
+    }
+
+    /// Drops a task-less idle reservation for testing.
+    ///
+    /// Test-only: mirrors the drop production applies when turn settings
+    /// fail (`clear_reserved_idle_turn`): the reservation and its
+    /// turn-scoped pending input are discarded while mailbox entries stay
+    /// retained. Returns `false` without touching anything unless the active
+    /// turn exists and still has no task.
+    #[doc(hidden)]
+    pub async fn test_clear_bare_idle_reservation(&self) -> bool {
+        let mut active_turn = self.session.active_turn.lock().await;
+        if active_turn.as_ref().is_some_and(|turn| turn.task.is_none()) {
+            *active_turn = None;
+            return true;
+        }
+        false
+    }
+
+    /// Overrides the session source for testing.
+    ///
+    /// Test-only bridge to [`Session::test_set_session_source`]: lets a suite
+    /// drive guardian-sourced turns on an otherwise ordinary thread.
+    /// Production sources are established at spawn and never mutated.
+    #[doc(hidden)]
+    pub async fn test_set_session_source(&self, source: codex_protocol::protocol::SessionSource) {
+        self.session.test_set_session_source(source).await;
     }
 
     async fn test_reserve_and_enqueue_exec_completion(&self) -> bool {

@@ -1,6 +1,8 @@
 use codex_core::StartIfIdleSubmission;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
+use codex_core::compact::SUMMARIZATION_PROMPT;
+use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::RolloutBudgetConfig;
 use codex_core::context::ContextualUserFragment;
 use codex_core::context::ExecCompletion;
@@ -8,11 +10,18 @@ use codex_core::context::ExecCompletionFragment;
 use codex_core::context::ExecOutputRetention;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSettingsOverrides;
+use codex_protocol::turn_input::NotSubmittedReason;
 use codex_protocol::user_input::UserInput;
 use codex_rollout::RolloutItem;
 use core_test_support::responses;
@@ -25,6 +34,7 @@ use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use pretty_assertions::assert_ne;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use wiremock::Mock;
@@ -75,14 +85,30 @@ async fn settle_session(codex: &codex_core::CodexThread) {
 }
 
 async fn start_initial_turn(codex: &codex_core::CodexThread) -> anyhow::Result<()> {
+    start_user_turn(codex, "run a background job").await
+}
+
+async fn start_user_turn(codex: &codex_core::CodexThread, text: &str) -> anyhow::Result<()> {
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "run a background job".to_string(),
+            text: text.to_string(),
             text_elements: Vec::new(),
         }]))
         .await?;
     wait_for_turn_complete(codex).await;
     Ok(())
+}
+
+fn plain_user_message(text: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }
 }
 
 /// User-role input texts of one WebSocket request body.
@@ -1328,5 +1354,480 @@ async fn accepted_response_cancelled_after_created_acknowledges_once() -> anyhow
     );
     drop(release_completed);
     server.shutdown().await;
+    Ok(())
+}
+
+/// AC1 (F1a): a bare idle reservation accepts injection, and a settings
+/// failure drops the reservation; retained runtime mail is still sampled
+/// exactly once. Part A pins the bare-accept mechanism through the public
+/// inject entry (a mutant that retains only task-present input fails the
+/// acceptance assert). Part B drives a real settings-gated drop: automatic
+/// input that would enter Plan mode is refused after reserving. Part C
+/// proves a notification that arrives during a bare window (its wake lost
+/// to the reservation) survives the drop and is sampled exactly once
+/// afterwards. Latches only; no sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_completion_survives_cleared_idle_reservation() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_completed("resp-initial"),
+            responses::sse_completed("resp-user"),
+            responses::sse_completed("resp-wake"),
+        ],
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    start_initial_turn(&test.codex).await?;
+
+    // Part A: the public inject entry accepts a bare (task-less) ActiveTurn.
+    // The mutant under test rejects exactly this case.
+    assert!(
+        test.codex.test_reserve_bare_idle_turn().await,
+        "idle session should reserve"
+    );
+    assert!(
+        test.codex
+            .inject_if_running(vec![plain_user_message("f1a bare-turn probe")])
+            .await
+            .is_ok(),
+        "inject_if_running must accept a bare ActiveTurn"
+    );
+    assert!(
+        test.codex.test_clear_bare_idle_reservation().await,
+        "bare reservation should drop"
+    );
+    // The drop discards turn-scoped input and leaves the session idle: with
+    // no active turn the same inject is refused and returns its items.
+    assert!(
+        test.codex
+            .inject_if_running(vec![plain_user_message("f1a post-drop probe")])
+            .await
+            .is_err(),
+        "dropped reservation must leave the session idle"
+    );
+
+    // Part B: a production settings gate drops a real reservation. The
+    // thread runs in the default (non-Plan) mode, so the automatic turn
+    // reserves before its Plan-mode settings are refused at commit time.
+    let plan = CollaborationMode {
+        mode: ModeKind::Plan,
+        settings: Settings {
+            model: "gpt-5.5".to_string(),
+            reasoning_effort: None,
+            developer_instructions: None,
+        },
+    };
+    let submission = test
+        .codex
+        .start_turn_if_idle(
+            TurnInputRequest::new(TurnInput::ResponseItem(plain_user_message(
+                "f1a automatic plan probe",
+            )))
+            .with_thread_settings(ThreadSettingsOverrides {
+                collaboration_mode: Some(plan),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    assert!(
+        matches!(
+            submission,
+            StartIfIdleSubmission::NotSubmitted {
+                reason: NotSubmittedReason::PlanMode,
+            }
+        ),
+        "automatic Plan-mode input must be refused after reserving, got {submission:?}"
+    );
+
+    // Part C: a notification that arrives during a bare window loses its
+    // wake to the reservation, survives the drop, and is sampled once.
+    assert!(test.codex.test_reserve_bare_idle_turn().await);
+    assert!(
+        test.codex.test_enqueue_exec_completion_notification().await,
+        "runtime notification should enqueue"
+    );
+    assert_eq!(
+        test.codex.test_runtime_notification_state().await,
+        (true, true),
+        "wake lost to the reservation must leave the entry staged"
+    );
+    assert!(test.codex.test_clear_bare_idle_reservation().await);
+    // A user turn bypasses the trigger-turn guard and samples without the
+    // fragment; the post-turn wake then samples the retained entry.
+    start_user_turn(&test.codex, "f1a follow-up user turn").await?;
+    assert_ne!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "dropped reservation must retain the runtime entry"
+    );
+    wait_for_turn_complete(&test.codex).await;
+
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 3);
+    assert_eq!(
+        count_exec_texts(&captured[0].message_input_texts("user")),
+        0
+    );
+    assert_eq!(
+        count_exec_texts(&captured[1].message_input_texts("user")),
+        0
+    );
+    assert_eq!(
+        count_exec_texts(&captured[2].message_input_texts("user")),
+        1,
+        "retained entry must be sampled exactly once"
+    );
+    let history = test.codex.load_history(/*include_archived*/ true).await?;
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| is_exec_completion_item(item))
+            .count(),
+        1
+    );
+    assert_eq!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "sampled lease must be gone"
+    );
+
+    settle_session(&test.codex).await;
+    assert_eq!(
+        requests.requests().len(),
+        3,
+        "no further wake turns after acknowledgement"
+    );
+    Ok(())
+}
+
+/// AC2 (F1b): two leases are recorded by a wake whose submission fails; the
+/// finishing task does not acknowledge them (recording is not sampling),
+/// the mailbox scheduler re-wakes, and the retry samples both exactly once
+/// with no second history append. Killed mutants: acknowledge-on-recording
+/// (no retry follows the failed turn) and fail-first-tracked-only (the
+/// second lease strands leased and the final state never cleans up).
+/// Latches only; no sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_completion_finishing_task_gets_sampling_wake() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_completed("resp-initial"),
+            responses::sse_failed("resp-fail", "invalid_prompt", "bad prompt"),
+            responses::sse_completed("resp-retry"),
+        ],
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    assert!(
+        test.codex
+            .test_enqueue_exec_completion_notifications_without_wake(2)
+            .await,
+        "runtime notifications should stage"
+    );
+    start_initial_turn(&test.codex).await?;
+    // The wake records both leases, its submission fails, and the finishing
+    // task leaves them pending instead of acknowledging the recording.
+    wait_for_turn_complete(&test.codex).await;
+    assert_ne!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "failed turn must keep both recorded leases pending"
+    );
+    // The mailbox scheduler re-wakes and samples both exactly once.
+    wait_for_turn_complete(&test.codex).await;
+
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 3);
+    assert_eq!(
+        count_exec_texts(&captured[0].message_input_texts("user")),
+        0
+    );
+    assert_eq!(
+        count_exec_texts(&captured[1].message_input_texts("user")),
+        2,
+        "failed wake still submits both recorded fragments"
+    );
+    assert_eq!(
+        count_exec_texts(&captured[2].message_input_texts("user")),
+        2,
+        "retry wake resubmits both retained fragments"
+    );
+    let history = test.codex.load_history(/*include_archived*/ true).await?;
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| is_exec_completion_item(item))
+            .count(),
+        2,
+        "retry must not append either fragment a second time"
+    );
+    assert_eq!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "both sampled leases must be gone"
+    );
+
+    settle_session(&test.codex).await;
+    assert_eq!(
+        requests.requests().len(),
+        3,
+        "no further wake turns after acknowledgement"
+    );
+    Ok(())
+}
+
+/// AC4/AC5/AC6: with WebSocket handshakes rejected (426) the wake falls back
+/// to HTTP; the failed HTTP submission keeps the receipt pending, the retry
+/// samples it once, and only the submitting transport's acceptance
+/// acknowledges it. No second history append. Killed mutant: acknowledgement
+/// skipped whenever websockets are enabled, which ignores the actual
+/// submission proof and suspends instead of sampling. Latches only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_completion_sampling_ack() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    Mock::given(method("GET"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(ResponseTemplate::new(426))
+        .mount(&server)
+        .await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_completed("resp-initial"),
+            responses::sse_failed("resp-fail", "invalid_prompt", "bad prompt"),
+            responses::sse_completed("resp-retry"),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.model_provider.supports_websockets = true;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    start_initial_turn(&test.codex).await?;
+
+    assert!(
+        test.codex.test_enqueue_exec_completion_notification().await,
+        "runtime notification should enqueue"
+    );
+    wait_for_turn_complete(&test.codex).await;
+    assert_ne!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "failed fallback submission must keep the receipt pending"
+    );
+    wait_for_turn_complete(&test.codex).await;
+
+    let handshake_attempted = server
+        .received_requests()
+        .await
+        .expect("mock server should retain received requests")
+        .iter()
+        .any(|request| request.method == "GET" && request.url.path().ends_with("/responses"));
+    assert!(
+        handshake_attempted,
+        "expected a websocket handshake attempt"
+    );
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 3);
+    assert_eq!(
+        count_exec_texts(&captured[0].message_input_texts("user")),
+        0
+    );
+    assert_eq!(
+        count_exec_texts(&captured[1].message_input_texts("user")),
+        1
+    );
+    assert_eq!(
+        count_exec_texts(&captured[2].message_input_texts("user")),
+        1,
+        "retry resubmits the retained fragment over the fallback transport"
+    );
+    let history = test.codex.load_history(/*include_archived*/ true).await?;
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| is_exec_completion_item(item))
+            .count(),
+        1,
+        "retry must not append the fragment a second time"
+    );
+    assert_eq!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "fallback-sampled lease must be gone"
+    );
+
+    settle_session(&test.codex).await;
+    assert_eq!(
+        requests.requests().len(),
+        3,
+        "no further wake turns after acknowledgement"
+    );
+    Ok(())
+}
+
+/// AC3 (compaction): a staged receipt is omitted from the compaction
+/// summarization request and from history surgery; the mailbox entry stays
+/// pending through the manual-compact turn and the post-compact wake samples
+/// it exactly once with no duplicate. Killed mutant: manual compact
+/// acknowledges staged leases, so no wake follows the compact turn.
+/// Latches only; no sleeps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_completion_compaction_omission_keeps_receipt_pending() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_completed("resp-initial"),
+            responses::sse(vec![
+                responses::ev_assistant_message(
+                    "m-compact",
+                    &format!("{SUMMARY_PREFIX}\ncompacted for test"),
+                ),
+                responses::ev_completed("resp-compact"),
+            ]),
+            responses::sse_completed("resp-wake"),
+        ],
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    start_initial_turn(&test.codex).await?;
+
+    assert!(
+        test.codex
+            .test_enqueue_exec_completion_notifications_without_wake(1)
+            .await,
+        "runtime notification should stage"
+    );
+    test.codex.submit(Op::Compact).await?;
+    wait_for_turn_complete(&test.codex).await;
+    assert_ne!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "compaction must leave the staged receipt pending"
+    );
+    wait_for_turn_complete(&test.codex).await;
+
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 3);
+    assert_eq!(
+        count_exec_texts(&captured[0].message_input_texts("user")),
+        0
+    );
+    assert!(
+        captured[1]
+            .body_json()
+            .to_string()
+            .contains(SUMMARIZATION_PROMPT),
+        "second request must be the compaction summarization"
+    );
+    assert_eq!(
+        count_exec_texts(&captured[1].message_input_texts("user")),
+        0,
+        "compaction must omit the staged receipt"
+    );
+    assert_eq!(
+        count_exec_texts(&captured[2].message_input_texts("user")),
+        1,
+        "post-compact wake samples the retained receipt"
+    );
+    let history = test.codex.load_history(/*include_archived*/ true).await?;
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| is_exec_completion_item(item))
+            .count(),
+        1
+    );
+    assert_eq!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "sampled lease must be gone"
+    );
+
+    settle_session(&test.codex).await;
+    assert_eq!(
+        requests.requests().len(),
+        3,
+        "no further wake turns after acknowledgement"
+    );
+    Ok(())
+}
+
+/// AC3 (guardian): guardian-sourced turns run guardian prompt preparation,
+/// which preserves (never omits) recorded exec fragments: the wake samples
+/// exactly once with no duplicate. Killed mutant: guardian preparation
+/// drops exec-fragment user messages, so the wake never samples and the
+/// entry retries to suspension instead of acknowledging. Latches only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_completion_guardian_prompt_preserves_receipt() -> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    let requests = responses::mount_sse_sequence(
+        &server,
+        vec![
+            responses::sse_completed("resp-initial"),
+            responses::sse_completed("resp-wake"),
+        ],
+    )
+    .await;
+    let test = test_codex().build_with_auto_env(&server).await?;
+    start_initial_turn(&test.codex).await?;
+
+    test.codex
+        .test_set_session_source(SessionSource::Internal(InternalSessionSource::Guardian))
+        .await;
+    assert!(
+        test.codex.test_enqueue_exec_completion_notification().await,
+        "runtime notification should enqueue"
+    );
+    wait_for_turn_complete(&test.codex).await;
+
+    let captured = requests.requests();
+    assert_eq!(captured.len(), 2);
+    assert_eq!(
+        count_exec_texts(&captured[0].message_input_texts("user")),
+        0
+    );
+    assert_eq!(
+        count_exec_texts(&captured[1].message_input_texts("user")),
+        1,
+        "guardian-sourced wake must sample the fragment"
+    );
+    let history = test.codex.load_history(/*include_archived*/ true).await?;
+    assert_eq!(
+        history
+            .items
+            .iter()
+            .filter(|item| is_exec_completion_item(item))
+            .count(),
+        1
+    );
+    assert_eq!(
+        test.codex.test_runtime_notification_state().await,
+        (false, false),
+        "sampled lease must be gone"
+    );
+
+    settle_session(&test.codex).await;
+    assert_eq!(
+        requests.requests().len(),
+        2,
+        "no further wake turns after acknowledgement"
+    );
     Ok(())
 }
