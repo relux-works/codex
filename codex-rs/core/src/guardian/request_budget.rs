@@ -147,6 +147,21 @@ pub(crate) async fn prepare_prompt(
             .input
             .extend(restored.iter().map(|envelope| envelope.item.clone()));
     }
+    prompt.input.retain(|item| {
+        let ResponseItem::Message { role, content, .. } = item else {
+            return true;
+        };
+        if role.as_str() != "user" {
+            return true;
+        }
+        !content.iter().any(|entry| {
+            matches!(
+                entry,
+                ContentItem::InputText { text }
+                    if text.contains("source=\"exec_completion\"")
+            )
+        })
+    });
     let request = session.services.model_client.build_responses_request(
         prompt,
         model,
