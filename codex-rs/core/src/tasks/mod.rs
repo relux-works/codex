@@ -300,7 +300,7 @@ impl TurnStartClaim {
             }
             TurnStartClaim::Reserved(expected) => {
                 let turn = active.as_mut()?;
-                if turn.task.is_none() && Arc::ptr_eq(&turn.turn_state, expected) {
+                if Arc::ptr_eq(&turn.turn_state, expected) {
                     Some(turn)
                 } else {
                     None
