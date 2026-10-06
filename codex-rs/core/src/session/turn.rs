@@ -1692,9 +1692,8 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
-                // Acknowledgement happened inside `try_run_sampling_request`
-                // at server acceptance; later drain, cancellation, or abort
-                // requeues nothing.
+                exec_completion_ack::acknowledge_submitted(&sess, &turn_context, &prompt.input)
+                    .await;
                 return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(err) => match err.details() {
@@ -2665,18 +2664,6 @@ async fn try_run_sampling_request(
                 ));
             }
         };
-
-        // Server acceptance is the only acknowledgement point: the first
-        // event proving the server is producing this response acknowledges
-        // exactly the tracked leases whose fragments the submitted prompt
-        // contains. Nothing later -- stream error, EOF, cancellation, budget
-        // failure, tool drain, turn abort -- can un-acknowledge them:
-        // acknowledgement untracks the members and removes them from the
-        // mailbox, and failing an acknowledged lease is a no-op.
-        if !exec_completion_accepted && exec_completion_ack::is_acceptance_event(&event) {
-            exec_completion_accepted = true;
-            exec_completion_ack::acknowledge_submitted(&sess, &turn_context, &prompt.input).await;
-        }
 
         sess.services
             .session_telemetry
