@@ -1,6 +1,7 @@
 mod capabilities;
 mod contributors;
 mod goal_activity;
+mod goal_background_wait;
 mod pending_work;
 mod registry;
 mod session_isolation;
@@ -11,6 +12,8 @@ mod user_instructions;
 
 pub use goal_activity::GoalActivity;
 pub use goal_activity::GoalActivityState;
+pub use goal_background_wait::GoalAdmissionDecision;
+pub use goal_background_wait::GoalBackgroundWaitAdmission;
 pub use pending_work::PendingWorkProvider;
 pub use pending_work::PendingWorkReadError;
 pub use pending_work::PendingWorkReceipt;
