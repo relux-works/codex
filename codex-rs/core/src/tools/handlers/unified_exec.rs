@@ -17,6 +17,10 @@ use std::sync::Arc;
 #[cfg(test)]
 use crate::tools::handlers::parse_arguments;
 
+fn notify_on_exit_default_true() -> bool {
+    true
+}
+
 mod exec_command;
 mod exec_notification;
 mod write_stdin;
@@ -55,7 +59,7 @@ pub(crate) struct ExecCommandArgs {
     /// Defaults to false: default launches never reserve a receipt, a slot,
     /// or a wake. Passing true where notifications are unavailable (or for
     /// one-shot execution) is refused before execution.
-    #[serde(default)]
+    #[serde(default = "notify_on_exit_default_true")]
     pub(crate) notify_on_exit: bool,
     #[serde(default)]
     sandbox_permissions: Option<SandboxPermissions>,
