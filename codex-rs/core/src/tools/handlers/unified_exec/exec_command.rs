@@ -265,14 +265,6 @@ impl ExecCommandHandler {
                         .to_string(),
                 ));
             }
-            if !AsyncNotificationSupport::read_from(&session.services.thread_extension_data)
-                .is_available()
-            {
-                return Err(FunctionCallError::RespondToModel(
-                    "notify_on_exit is not supported on this host; no completion wake can be promised. Retry without notify_on_exit."
-                        .to_string(),
-                ));
-            }
         }
         let notify_on_exit = args.notify_on_exit;
         let sandbox_permissions =
