@@ -54,9 +54,7 @@ pub fn try_register_goal_wait_sleep(store: &ExtensionData, generation: u64) -> b
 /// Returns `true` when a goal-owned marker was removed, `false` when absent
 /// or foreign (foreign markers are preserved).
 pub fn remove_goal_wait_sleep(store: &ExtensionData) -> bool {
-    store.remove_if(|existing: Option<&SleepItem>| {
-        existing.is_some_and(|item| is_goal_wait_sleep_id(item.id.as_str()))
-    })
+    store.remove::<SleepItem>().is_some()
 }
 
 /// Reports whether a goal-owned wait marker is currently stored.
