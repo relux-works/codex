@@ -478,10 +478,9 @@ impl BackgroundWaitState {
     /// The check-in epoch is anchored at the last human input: admitted
     /// check-in turns and other automatic turns never move it.
     pub fn note_turn_start(&self) {
-        self.inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .invalidate_tickets();
+        let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        state.invalidate_tickets();
+        state.wait_started_at = None;
     }
 
     /// Invalidates tickets on steering.
