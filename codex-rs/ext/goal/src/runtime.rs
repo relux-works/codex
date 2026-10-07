@@ -681,15 +681,12 @@ impl GoalRuntimeHandle {
                         ?next_check_in,
                         "goal continuation waiting for subscribed work"
                     );
-                    // Hold the goal permit across the install so concurrent
-                    // continuations serialize; spawning never awaits, so the
-                    // permit is never held across the delay itself.
                     if let Some(deadline) = next_check_in
                         && let Some((armed_deadline, armed_generation)) =
                             self.inner.background_wait.armed_deadline()
                         && armed_deadline == deadline
                     {
-                        self.spawn_check_in_timer(deadline, armed_generation);
+                        let _ = (deadline, armed_generation);
                     }
                     return Ok(());
                 }
