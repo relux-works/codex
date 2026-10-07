@@ -121,37 +121,9 @@ impl CheckInTimer {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot
-            .entry
-            .as_ref()
-            .is_some_and(|existing| existing.generation > generation)
-        {
-            return false;
-        }
-        if let Some(old) = slot.entry.take() {
-            old.handle.abort();
-        }
-        let id = slot.next_id;
-        slot.next_id += 1;
-        let clock = Arc::clone(&self.clock);
-        let slot_for_fire = Arc::clone(&self.slot);
-        let handle = tokio::spawn(async move {
-            clock.sleep_until(deadline).await;
-            {
-                let mut slot = slot_for_fire.lock().unwrap_or_else(PoisonError::into_inner);
-                if slot.entry.as_ref().is_some_and(|entry| entry.id == id) {
-                    slot.entry.take();
-                }
-            }
-            on_fire().await;
-        });
-        slot.entry = Some(TimerEntry {
-            id,
-            generation,
-            handle,
-        });
-        true
+        let _ = (&deadline, generation, &on_fire);
+        let _ = &self.slot;
+        false
     }
 
     /// Aborts the pending timer, if any.
