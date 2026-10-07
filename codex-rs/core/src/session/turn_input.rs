@@ -57,7 +57,7 @@ mod tests;
 
 /// Why input is starting a turn; shared by admission and input delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TurnStartKind {
+pub(crate) enum TurnStartKind {
     User,
     Automatic,
     Recovery,
@@ -455,6 +455,16 @@ async fn start_if_idle(
         });
     }
 
+    let start_trigger = start.turn_trigger.clone();
+    let goal_admission =
+        super::goal_admission::check_goal_admission(session, kind, start_trigger.as_deref());
+    if let Some(reason) = goal_admission.reason {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted { reason });
+    }
+    let goal_admitted_revision = goal_admission.admitted_revision;
+
     let settings = match PreparedTurnInputSettings::prepare(session, thread_settings, start).await {
         Ok(settings) => settings,
         Err(error) => {
@@ -510,6 +520,18 @@ async fn start_if_idle(
                     .await;
             }
         }
+    }
+    // Late revision recheck: a receipt transition may have landed during the
+    // awaited preparation window after the early admission check. Recompare
+    // immediately before committing the turn; on mismatch abandon cleanly with
+    // no ownerless reservation. The early check already consumed any ticket
+    // exactly once, per AC4.
+    if let Some(reason) =
+        super::goal_admission::recheck_goal_admission_before_start(session, goal_admitted_revision)
+    {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted { reason });
     }
     session
         .start_task(

@@ -234,6 +234,10 @@ pub enum NotSubmittedReason {
     /// would run in Plan mode.
     PlanMode,
 
+    /// `start_turn_if_idle` received an automatic goal continuation while the
+    /// goal background-wait policy was waiting for subscribed work.
+    GoalBackgroundWait,
+
     /// `steer_turn` found no active turn.
     NoActiveTurn,
 

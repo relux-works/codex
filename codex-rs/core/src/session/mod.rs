@@ -234,6 +234,7 @@ mod environment;
 pub(crate) mod exec_completion_ack;
 mod extension_interruption;
 pub(crate) mod extension_metrics;
+mod goal_admission;
 mod guardian_checkpoint;
 mod handlers;
 mod inject;

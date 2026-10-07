@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use codex_core::StartIfIdleSubmission;
 use codex_core::ThreadManager;
@@ -20,6 +21,11 @@ use crate::activity::GoalTurnStartLease;
 use crate::activity::GoalTurnStartPermit;
 use crate::analytics::GoalAnalytics;
 use crate::analytics::GoalEventAttribution;
+use crate::background_wait::BackgroundWaitEvaluation;
+use crate::background_wait::BackgroundWaitState;
+use crate::background_wait::GoalWaitStatus;
+use crate::check_in_clock::CheckInClock;
+use crate::check_in_clock::CheckInTimer;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
 use crate::steering::continuation_steering_item;
@@ -39,6 +45,7 @@ pub(crate) struct GoalRuntimeConfig {
     pub(crate) tools_available_for_thread: bool,
     pub(crate) tools_visible_for_thread: bool,
     pub(crate) root_accounting_state: Option<Arc<GoalAccountingState>>,
+    pub(crate) check_in_clock: Arc<dyn CheckInClock>,
 }
 
 pub(crate) enum ActiveGoalStopReason {
@@ -62,6 +69,8 @@ struct GoalRuntimeInner {
     tools_visible_for_thread: bool,
     goal_state_lock: Arc<Semaphore>,
     activity: GoalActivityPublisher,
+    background_wait: Arc<BackgroundWaitState>,
+    check_in_timer: CheckInTimer,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -102,6 +111,9 @@ impl GoalRuntimeHandle {
         accounting_state: Arc<GoalAccountingState>,
         config: GoalRuntimeConfig,
     ) -> Self {
+        let background_wait = Arc::new(BackgroundWaitState::new());
+        let check_in_timer = CheckInTimer::new(config.check_in_clock);
+        background_wait.set_invalidation_hook(check_in_timer.abort_hook());
         Self {
             inner: Arc::new(GoalRuntimeInner {
                 thread_id,
@@ -117,6 +129,8 @@ impl GoalRuntimeHandle {
                 tools_visible_for_thread: config.tools_visible_for_thread,
                 goal_state_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
                 activity: GoalActivityPublisher::new(config.enabled),
+                background_wait,
+                check_in_timer,
             }),
         }
     }
@@ -135,8 +149,14 @@ impl GoalRuntimeHandle {
         self.inner.enabled.store(false, Ordering::Relaxed);
         self.inner.activity.stop(store);
         self.inner.accounting_state.clear_active_goal();
+        self.inner.background_wait.note_stop();
         store.remove::<TurnStartOptions>();
         store.remove::<GoalTurnStartPermit>();
+    }
+
+    /// Goal-owned background waiting policy for this thread.
+    pub fn background_wait_state(&self) -> Arc<BackgroundWaitState> {
+        Arc::clone(&self.inner.background_wait)
     }
 
     // Callers hold the goal-state permit across the committed mutation/read and
@@ -333,6 +353,7 @@ impl GoalRuntimeHandle {
         self.inner
             .analytics
             .status_changed(&goal, previous_status, GoalEventAttribution::NoTurn);
+        self.inner.background_wait.note_goal_mutation();
         let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
             !replaced_existing_goal && previous_goal.objective != goal.objective
         });
@@ -377,6 +398,7 @@ impl GoalRuntimeHandle {
         let permit = self.goal_state_permit().await?;
         let committed = self.reconcile_live_activity(&permit).await?;
         self.inner.analytics.cleared(&goal);
+        self.inner.background_wait.note_clear();
         if committed.is_none() {
             self.inner.accounting_state.clear_active_goal();
         }
@@ -506,6 +528,7 @@ impl GoalRuntimeHandle {
             GoalEventAttribution::Turn(turn_id),
         );
         self.inner.accounting_state.clear_active_goal();
+        self.inner.background_wait.note_goal_mutation();
         let goal = protocol_goal_from_state(goal);
         self.inner.event_emitter.thread_goal_updated(
             format!("{turn_id}:{event_name}"),
@@ -518,6 +541,7 @@ impl GoalRuntimeHandle {
     pub async fn restore_after_resume(&self) -> Result<(), String> {
         let permit = self.goal_state_permit().await?;
         let goal = self.reconcile_live_activity(&permit).await?;
+        self.inner.background_wait.note_resume();
         if !self.is_enabled() {
             return Ok(());
         }
@@ -532,6 +556,45 @@ impl GoalRuntimeHandle {
             Some(_) | None => self.inner.accounting_state.clear_active_goal(),
         }
         Ok(())
+    }
+
+    /// Schedules one re-entry of [`GoalRuntimeHandle::continue_if_idle`] at `deadline`.
+    ///
+    /// Replaces any pending timer of the same or older generation; a stale
+    /// install for an older generation is rejected without disturbing the live
+    /// timer. The timer task holds no goal semaphore permit while sleeping and
+    /// only a weak runtime handle, so dropping the runtime never leaks through
+    /// a pending timer. On fire it detaches itself from the cancellable slot
+    /// before claiming the state's registration for `(deadline, generation)`;
+    /// a superseded or invalidated timer exits quietly instead of re-entering.
+    /// Callers hold the goal permit across evaluation and this install so
+    /// concurrent continuations serialize; the spawn itself never awaits.
+    fn spawn_check_in_timer(&self, deadline: Duration, generation: u64) {
+        let state = Arc::clone(&self.inner.background_wait);
+        let clock = Arc::clone(self.inner.check_in_timer.clock());
+        let inner = Arc::downgrade(&self.inner);
+        let installed = self
+            .inner
+            .check_in_timer
+            .spawn(deadline, generation, move || async move {
+                if !state.claim_due_deadline(deadline, generation, clock.now()) {
+                    return;
+                }
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let runtime = GoalRuntimeHandle { inner };
+                if let Err(err) = runtime.continue_if_idle().await {
+                    tracing::warn!("scheduled goal check-in failed: {err}");
+                }
+            });
+        if !installed {
+            tracing::debug!(
+                ?deadline,
+                generation,
+                "stale check-in timer install rejected; live timer kept"
+            );
+        }
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
@@ -571,6 +634,59 @@ impl GoalRuntimeHandle {
         if goal.status != codex_state::ThreadGoalStatus::Active {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
+        }
+        if self.inner.background_wait.is_enabled() {
+            let snapshot = codex_extension_api::read_pending_work(thread.thread_extension_data());
+            let now = self.inner.check_in_timer.clock().now();
+            match self.inner.background_wait.evaluate_continuation(
+                goal.goal_id.as_str(),
+                GoalWaitStatus::Active,
+                snapshot,
+                now,
+            ) {
+                BackgroundWaitEvaluation::ProceedWithoutGate
+                | BackgroundWaitEvaluation::ProceedNormal { .. }
+                | BackgroundWaitEvaluation::ProceedWithTicket { .. } => {
+                    thread
+                        .thread_extension_data()
+                        .insert(self.inner.background_wait.admission_checker());
+                }
+                BackgroundWaitEvaluation::Wait {
+                    next_check_in,
+                    emit_warning,
+                } => {
+                    if emit_warning {
+                        self.inner.event_emitter.background_wait_warning(
+                            self.thread_id().to_string(),
+                            crate::background_wait::CHECK_INS_STOPPED_WARNING.to_string(),
+                        );
+                    }
+                    tracing::debug!(
+                        ?next_check_in,
+                        "goal continuation waiting for subscribed work"
+                    );
+                    // Hold the goal permit across the install so concurrent
+                    // continuations serialize; spawning never awaits, so the
+                    // permit is never held across the delay itself.
+                    if let Some(deadline) = next_check_in
+                        && let Some((armed_deadline, armed_generation)) =
+                            self.inner.background_wait.armed_deadline()
+                        && armed_deadline == deadline
+                    {
+                        self.spawn_check_in_timer(deadline, armed_generation);
+                    }
+                    return Ok(());
+                }
+                BackgroundWaitEvaluation::WaitOnReadFailure { error } => {
+                    tracing::warn!(
+                        %error,
+                        "goal continuation waiting: pending-work read failed, \
+                         safe behavior treats failure as unknown rather than empty"
+                    );
+                    drop(goal_state_permit);
+                    return Ok(());
+                }
+            }
         }
         let start_options = thread
             .thread_extension_data()
@@ -633,6 +749,7 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn inject_active_turn_steering(&self, item: ResponseItem) {
+        self.inner.background_wait.note_steering();
         let Some(thread_manager) = self.inner.thread_manager.upgrade() else {
             tracing::debug!("skipping goal steering because thread manager is unavailable");
             return;

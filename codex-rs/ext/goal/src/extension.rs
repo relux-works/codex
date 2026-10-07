@@ -24,6 +24,8 @@ use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnErrorInput;
+use codex_extension_api::TurnInputContext;
+use codex_extension_api::TurnInputContributor;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
@@ -41,6 +43,7 @@ use crate::accounting::GoalAccountingState;
 use crate::activity::GoalTurnStartPermit;
 use crate::analytics::GoalAnalytics;
 use crate::api::GoalService;
+use crate::check_in_clock::SystemCheckInClock;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
 use crate::runtime::ActiveGoalStopReason;
@@ -155,6 +158,7 @@ where
                         tools_available_for_thread,
                         tools_visible_for_thread,
                         root_accounting_state,
+                        check_in_clock: Arc::new(SystemCheckInClock),
                     },
                 )
             });
@@ -241,6 +245,7 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
+            runtime.background_wait_state().note_turn_start();
             if !runtime.is_enabled() {
                 return;
             }
@@ -588,6 +593,29 @@ where
     }
 }
 
+impl<C> TurnInputContributor for GoalExtension<C>
+where
+    C: Send + Sync + 'static,
+{
+    fn contribute<'a>(
+        &'a self,
+        input: TurnInputContext<'a>,
+        _extension_metrics: Option<std::sync::Arc<dyn codex_extension_api::ExtensionMetrics>>,
+        _session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Vec<Box<dyn codex_extension_api::ContextualUserFragment + Send>>> {
+        Box::pin(async move {
+            if !input.user_input.is_empty()
+                && let Some(runtime) = goal_runtime_handle(thread_store)
+            {
+                runtime.background_wait_state().note_human_input();
+            }
+            Vec::new()
+        })
+    }
+}
+
 impl<C> ToolContributor for GoalExtension<C>
 where
     C: Send + Sync + 'static,
@@ -668,6 +696,7 @@ pub fn install_with_backend<C>(
     registry.turn_lifecycle_contributor(extension.clone());
     registry.token_usage_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
+    registry.turn_input_contributor(extension.clone());
     registry.tool_contributor(extension);
 }
 
