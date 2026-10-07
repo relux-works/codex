@@ -274,7 +274,7 @@ impl ExecCommandHandler {
                 ));
             }
         }
-        let notify_on_exit = args.notify_on_exit;
+        let _ = args.notify_on_exit;
         let sandbox_permissions =
             resolve_sandbox_permissions(args.sandbox_permissions, args.justification.as_deref())?;
         let hook_command = args.cmd.clone();
@@ -463,11 +463,7 @@ impl ExecCommandHandler {
             justification,
             prefix_rule,
         };
-        let completion_mode = if notify_on_exit {
-            ExecCompletionMode::NotifyOnExit
-        } else {
-            ExecCompletionMode::Default
-        };
+        let completion_mode = ExecCompletionMode::NotifyOnExit;
         let result = match completion_timeout {
             Some(timeout) => {
                 UnifiedExecProcessManager::exec_command_to_completion(request, &context, timeout)
