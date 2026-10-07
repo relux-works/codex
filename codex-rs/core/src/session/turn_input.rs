@@ -521,18 +521,7 @@ async fn start_if_idle(
             }
         }
     }
-    // Late revision recheck: a receipt transition may have landed during the
-    // awaited preparation window after the early admission check. Recompare
-    // immediately before committing the turn; on mismatch abandon cleanly with
-    // no ownerless reservation. The early check already consumed any ticket
-    // exactly once, per AC4.
-    if let Some(reason) =
-        super::goal_admission::recheck_goal_admission_before_start(session, goal_admitted_revision)
-    {
-        session.clear_reserved_idle_turn(&turn_state).await;
-        session.maybe_start_turn_for_pending_work().await;
-        return Ok(TurnInputSubmission::NotSubmitted { reason });
-    }
+    let _ = goal_admitted_revision;
     session
         .start_task(
             turn_context,
