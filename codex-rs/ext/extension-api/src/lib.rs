@@ -1,6 +1,7 @@
 mod capabilities;
 mod contributors;
 mod goal_activity;
+mod pending_work;
 mod registry;
 mod session_isolation;
 mod state;
@@ -10,6 +11,11 @@ mod user_instructions;
 
 pub use goal_activity::GoalActivity;
 pub use goal_activity::GoalActivityState;
+pub use pending_work::PendingWorkProvider;
+pub use pending_work::PendingWorkReadError;
+pub use pending_work::PendingWorkReceipt;
+pub use pending_work::PendingWorkSnapshot;
+pub use pending_work::read_pending_work;
 pub use session_isolation::IsolatedSessionExtensions;
 pub use session_isolation::SessionIsolation;
 pub use tool_policy::ToolPolicy;

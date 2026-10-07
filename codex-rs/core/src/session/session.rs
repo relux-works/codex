@@ -1674,13 +1674,17 @@ impl Session {
             );
             let reasoning_effort_override_enabled =
                 config.features.enabled(Feature::ReasoningEffortOverride) && !title_request;
+            let pending_work_revision = Arc::new(AtomicU64::new(0));
+            let input_queue =
+                InputQueue::new_with_revision(Arc::clone(&pending_work_revision));
             let services = SessionServices {
                 // Start with an empty connection set. The initialized set is
                 // published after SessionConfigured so MCP events follow it.
                 mcp_runtime,
                 mcp_handler_cache: Default::default(),
-                unified_exec_manager: UnifiedExecProcessManager::new(
+                unified_exec_manager: UnifiedExecProcessManager::new_with_revision(
                     config.background_terminal_max_timeout,
+                    Arc::clone(&pending_work_revision),
                 ),
                 elicitations: crate::elicitation::ElicitationService::new(),
                 shell_zsh_path: config.zsh_path.clone(),
@@ -1802,13 +1806,26 @@ impl Session {
                 .then(|| Mutex::new(Default::default())),
                 active_turn: Mutex::new(None),
                 async_hook_results,
-                input_queue: InputQueue::new(),
+                input_queue,
                 services,
                 git_enrichment_policy,
                 fork_persistence,
                 forked_from_ordinal_exclusive,
                 next_internal_sub_id: AtomicU64::new(0),
             });
+            {
+                let weak = Arc::downgrade(&sess);
+                sess.services.thread_extension_data.insert(
+                    codex_extension_api::PendingWorkProvider::new(move || {
+                        let Some(session) = weak.upgrade() else {
+                            return Err(
+                                codex_extension_api::PendingWorkReadError::SessionUnavailable,
+                            );
+                        };
+                        super::pending_work::try_read_snapshot(session.as_ref())
+                    }),
+                );
+            }
             if let Some(startup) = &startup {
                 let _ = startup.session.set(Arc::clone(&sess));
             }
