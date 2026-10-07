@@ -29,3 +29,7 @@ pub(crate) fn is_final(status: &AgentStatus) -> bool {
         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
     )
 }
+
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod tests;

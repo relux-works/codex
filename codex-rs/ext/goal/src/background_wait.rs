@@ -277,8 +277,29 @@ impl BackgroundWaitState {
         snapshot: Result<PendingWorkSnapshot, PendingWorkReadError>,
         now: Duration,
     ) -> BackgroundWaitEvaluation {
+        self.evaluate_continuation_with_native_pending(
+            goal_id, status, snapshot, /*native_pending*/ false, now,
+        )
+    }
+
+    /// Evaluates one goal continuation attempt with native subagent work.
+    ///
+    /// Same as [`BackgroundWaitState::evaluate_continuation`], but an empty
+    /// exec snapshot still waits (with the same check-in schedule) when
+    /// `native_pending` is true (loaded `PendingInit`/`Running` native
+    /// children). Admission still compares only the exec work revision; native
+    /// completion wakes via the durable-sleep marker and mailbox mail, not via
+    /// revision changes.
+    pub fn evaluate_continuation_with_native_pending(
+        &self,
+        goal_id: &str,
+        status: GoalWaitStatus,
+        snapshot: Result<PendingWorkSnapshot, PendingWorkReadError>,
+        native_pending: bool,
+        now: Duration,
+    ) -> BackgroundWaitEvaluation {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        self.evaluate_locked(&mut state, goal_id, status, snapshot, now)
+        self.evaluate_locked(&mut state, goal_id, status, snapshot, native_pending, now)
     }
 
     fn evaluate_locked(
@@ -287,6 +308,7 @@ impl BackgroundWaitState {
         goal_id: &str,
         status: GoalWaitStatus,
         snapshot: Result<PendingWorkSnapshot, PendingWorkReadError>,
+        native_pending: bool,
         now: Duration,
     ) -> BackgroundWaitEvaluation {
         if !state.enabled || status == GoalWaitStatus::InactiveOrBudgetLimited {
@@ -311,7 +333,7 @@ impl BackgroundWaitState {
                 return BackgroundWaitEvaluation::WaitOnReadFailure { error };
             }
         };
-        if snapshot.is_empty() {
+        if snapshot.is_empty() && !native_pending {
             state.wait_started_at = None;
             state.pending_deadline = None;
             state.admission_attempt = Some(AdmissionAttempt {

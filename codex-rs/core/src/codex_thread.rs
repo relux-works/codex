@@ -1,5 +1,7 @@
 use crate::agent::AgentStatus;
 use crate::agent::api::AgentControl;
+use crate::agent::owned_children::OwnedChildInspection;
+use crate::agent::owned_children::OwnedChildrenReadError;
 use crate::config::ConstraintResult;
 use crate::context::ContextualUserFragment;
 use crate::context::GuardianReviewEvidence;
@@ -489,6 +491,33 @@ impl CodexThread {
     /// Returns extension-owned data attached to this thread runtime.
     pub fn thread_extension_data(&self) -> &codex_extension_api::ExtensionData {
         &self.session.services.thread_extension_data
+    }
+
+    /// Inspects this thread's directly owned native children.
+    ///
+    /// Narrow goal-wait query: each live `ThreadSpawn` edge owned by this
+    /// thread reports its current status without restoring runtimes. Unknown
+    /// identities and backend failures return [`OwnedChildrenReadError`];
+    /// failed lookups are never silently skipped.
+    pub async fn inspect_directly_owned_native_children(
+        &self,
+    ) -> Result<Vec<OwnedChildInspection>, OwnedChildrenReadError> {
+        self.session
+            .services
+            .local_agent_runtime
+            .inspect_directly_owned_native_children(self.session.thread_id)
+            .await
+    }
+
+    /// Rechecks pending mailbox work after registering a goal wait marker.
+    ///
+    /// Closes completion-before-registration: a native child finishing between
+    /// the idle inspection and the marker insert already enqueued queue-only
+    /// mail without waking (no marker existed yet); this re-runs the existing
+    /// pending-work scheduler, which now sees the marker and starts the wake.
+    /// A child finishing after the insert wakes via its own enqueue path.
+    pub async fn recheck_pending_work_for_goal_wait(&self) {
+        self.session.maybe_start_turn_for_pending_work().await;
     }
 
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
