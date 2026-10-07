@@ -129,13 +129,6 @@ impl ExecNotificationHandler {
                     .release_completion_receipt(receipt_id, &owner)
                     .await
                     .map_err(|err| FunctionCallError::RespondToModel(receipt_error_message(err)))?;
-                // Drop a pending wake for the disarmed subscription, if any.
-                // A later exit publishes nothing for a released receipt, so
-                // together these guarantee no wake after release.
-                session
-                    .input_queue
-                    .cancel_runtime_notification(receipt_id)
-                    .await;
                 Ok(boxed_tool_output(FunctionToolOutput::from_text(
                     format!(
                         "Released receipt {}; the completion wake is disarmed and the process was not terminated.",
