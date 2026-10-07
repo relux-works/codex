@@ -2140,5 +2140,7 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
     }
 }
 
+#[path = "goal_extension_backend/background_wait_activation_tests.rs"]
+mod background_wait_activation;
 #[path = "goal_extension_backend/goal_activity_tests.rs"]
 mod goal_activity;

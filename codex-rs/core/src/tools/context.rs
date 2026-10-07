@@ -391,6 +391,13 @@ pub struct ExecCommandToolOutput {
     /// Bytes omitted by the output collection cap before model-facing truncation.
     pub output_omitted_bytes: Option<NonZeroUsize>,
     pub hook_command: Option<String>,
+    /// Model-visible receipt handle acknowledging an armed completion wake.
+    ///
+    /// Set only when `notify_on_exit` was accepted and the subscription armed
+    /// (or a raced exit queued): its presence is the wake promise, and the
+    /// handle is the key for `exec_notification` read/release. Absent on every
+    /// other response, including default launches and inline results.
+    pub completion_receipt: Option<String>,
 }
 
 impl ToolOutput for ExecCommandToolOutput {
@@ -537,6 +544,12 @@ impl ExecCommandToolOutput {
 
         if let Some(process_id) = &self.process_id {
             sections.push(format!("Process running with session ID {process_id}"));
+        }
+
+        if let Some(receipt) = &self.completion_receipt {
+            sections.push(format!(
+                "Completion notification armed with receipt ID {receipt}; the runtime will deliver completion when the process exits"
+            ));
         }
 
         if let Some(original_token_count) = self.original_token_count {

@@ -18,10 +18,12 @@ use std::sync::Arc;
 use crate::tools::handlers::parse_arguments;
 
 mod exec_command;
+mod exec_notification;
 mod write_stdin;
 
 pub use exec_command::ExecCommandHandler;
 pub(crate) use exec_command::ExecCommandHandlerOptions;
+pub use exec_notification::ExecNotificationHandler;
 pub use write_stdin::WriteStdinHandler;
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +50,13 @@ pub(crate) struct ExecCommandArgs {
         deserialize_with = "codex_tools::arguments::option_usize::deserialize"
     )]
     max_output_tokens: Option<usize>,
+    /// Opt-in completion wake, advertised only on capable hosts.
+    ///
+    /// Defaults to false: default launches never reserve a receipt, a slot,
+    /// or a wake. Passing true where notifications are unavailable (or for
+    /// one-shot execution) is refused before execution.
+    #[serde(default)]
+    pub(crate) notify_on_exit: bool,
     #[serde(default)]
     sandbox_permissions: Option<SandboxPermissions>,
     #[serde(default)]

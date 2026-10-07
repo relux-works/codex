@@ -50,6 +50,16 @@ impl ReceiptOwner {
             call_id: call_id.into_boxed_str(),
         })
     }
+
+    /// Owning thread for tool-path ownership checks.
+    pub(crate) fn thread_id(&self) -> ThreadId {
+        self.thread_id
+    }
+
+    /// Owning runtime generation for tool-path ownership checks.
+    pub(crate) fn runtime_generation(&self) -> u64 {
+        self.runtime_generation
+    }
 }
 
 impl Debug for ReceiptOwner {
@@ -72,10 +82,19 @@ impl ReceiptId {
     /// Model-visible handle for this receipt: the hyphenated lowercase UUID.
     ///
     /// [`Debug`] stays opaque so logs never leak handles; use this only for
-    /// model-visible context. The format is stable: a later story parses it
-    /// back for retained-output reads.
+    /// model-visible context. The format is stable: `exec_notification`
+    /// parses it back with [`ReceiptId::from_model_handle`].
     pub(crate) fn model_handle(&self) -> String {
         self.0.hyphenated().to_string()
+    }
+
+    /// Parses a model-supplied handle back into a receipt id.
+    ///
+    /// Surrounding whitespace is tolerated; anything that is not a UUID is
+    /// `None` and the caller rejects it as an unknown receipt. A parsed id is
+    /// still only a lookup key: ownership is verified separately.
+    pub(crate) fn from_model_handle(handle: &str) -> Option<Self> {
+        Uuid::parse_str(handle.trim()).ok().map(Self)
     }
 }
 
@@ -114,7 +133,7 @@ pub(crate) enum InitialResponseDecision {
 pub(crate) enum InitialResponseOutcome {
     InlineResult(TerminalCompletion),
     Armed,
-    Queued,
+    Queued(TerminalCompletion),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -479,7 +498,7 @@ impl CompletionReceiptStore {
             Action::Queued(completion) => {
                 if let Some(record) = state.active.get_mut(&receipt_id) {
                     record.phase = ReceiptPhase::Queued(completion);
-                    InitialResponseOutcome::Queued
+                    InitialResponseOutcome::Queued(completion)
                 } else {
                     return Err(ReceiptError::UnknownReceipt);
                 }
