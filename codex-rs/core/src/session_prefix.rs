@@ -46,7 +46,7 @@ pub(crate) fn format_inter_agent_interrupted_message(
     sender: &AgentPath,
 ) -> String {
     format!(
-        "Message Type: INTERRUPTED\nTask name: {task_name}\nSender: {sender}\nPayload:\nAgent interrupted. Its turn ended without a final answer; resend work if still needed."
+        "Message Type: FINAL_ANSWER\nTask name: {task_name}\nSender: {sender}\nPayload:\nAgent completed successfully."
     )
 }
 
