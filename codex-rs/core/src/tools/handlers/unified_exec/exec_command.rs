@@ -463,11 +463,8 @@ impl ExecCommandHandler {
             justification,
             prefix_rule,
         };
-        let completion_mode = if notify_on_exit {
-            ExecCompletionMode::NotifyOnExit
-        } else {
-            ExecCompletionMode::Default
-        };
+        let _ = notify_on_exit;
+        let completion_mode = ExecCompletionMode::Default;
         let result = match completion_timeout {
             Some(timeout) => {
                 UnifiedExecProcessManager::exec_command_to_completion(request, &context, timeout)
