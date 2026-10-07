@@ -274,6 +274,52 @@ impl TestWakeLeaseGate {
     }
 }
 
+/// Test-only gate pausing an automatic goal start inside `start_task`.
+///
+/// A suite arms one gate to deterministically interleave a receipt Arm with
+/// the residual window after the late admission recheck and before turn
+/// publication: the starting task signals arrival once it holds the active
+/// reservation inside `start_task` and waits for release, while the suite
+/// arms a receipt and then releases it. Production inserts no gate; both
+/// hooks are no-ops when none is present. Only automatic goal continuation
+/// with an admitted work revision consults this gate.
+#[doc(hidden)]
+pub struct TestGoalStartTaskGate {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl TestGoalStartTaskGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Signals that a gated goal start reached the pre-publication pause.
+    pub(crate) fn signal_arrived(&self) {
+        self.arrived.notify_one();
+    }
+
+    /// Waits for the suite to release the gated goal start.
+    pub(crate) async fn wait_release(&self) {
+        self.release.notified().await;
+    }
+
+    /// Waits for the gated goal start to reach the pre-publication pause.
+    #[doc(hidden)]
+    pub async fn wait_arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    /// Releases the gated goal start.
+    #[doc(hidden)]
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
 impl CodexThread {
@@ -531,6 +577,67 @@ impl CodexThread {
             .services
             .thread_extension_data
             .remove::<TestWakeLeaseGate>();
+    }
+
+    /// Arms the goal start-task gate for testing.
+    ///
+    /// Test-only: the next automatic goal start carrying an admitted work
+    /// revision pauses inside `start_task` after the late admission recheck
+    /// and before turn publication, so a suite can arm a receipt in that
+    /// residual window. Pair with [`Self::test_disarm_goal_start_task_gate`].
+    #[doc(hidden)]
+    pub async fn test_arm_goal_start_task_gate(&self) -> Arc<TestGoalStartTaskGate> {
+        self.session
+            .services
+            .thread_extension_data
+            .remove::<TestGoalStartTaskGate>();
+        self.session
+            .services
+            .thread_extension_data
+            .get_or_init(TestGoalStartTaskGate::new)
+    }
+
+    /// Disarms the goal start-task gate for testing.
+    ///
+    /// Test-only: removes the gate armed by
+    /// [`Self::test_arm_goal_start_task_gate`]. Gated hooks are no-ops once
+    /// no gate is present.
+    #[doc(hidden)]
+    pub async fn test_disarm_goal_start_task_gate(&self) {
+        self.session
+            .services
+            .thread_extension_data
+            .remove::<TestGoalStartTaskGate>();
+    }
+
+    /// Arms one exec-completion receipt without publishing an exit.
+    ///
+    /// Test-only: reserves a real completion receipt and arms it, leaving it
+    /// pending as Armed work with no runtime mailbox entry and no idle wake.
+    /// Goal background-wait suites use this to hold a stalled subscription
+    /// while paused time alone drives scheduled check-ins. Production arming
+    /// arrives with opted-in exec launches (story E).
+    #[doc(hidden)]
+    pub async fn test_arm_exec_receipt_for_background_wait(&self) -> bool {
+        use crate::unified_exec::completion_receipt::InitialResponseDecision;
+        use crate::unified_exec::completion_receipt::InitialResponseOutcome;
+        use crate::unified_exec::completion_receipt::ReceiptOwner;
+
+        let Ok(owner) = ReceiptOwner::new(
+            self.session.thread_id,
+            /*runtime_generation*/ 1,
+            format!("test-call-{}", uuid::Uuid::new_v4()),
+        ) else {
+            return false;
+        };
+        let store = self.session.services.unified_exec_manager.receipt_store();
+        let Ok(receipt_id) = store.reserve(owner.clone()) else {
+            return false;
+        };
+        matches!(
+            store.resolve_initial_response(receipt_id, &owner, InitialResponseDecision::Arm),
+            Ok(InitialResponseOutcome::Armed)
+        )
     }
 
     async fn test_reserve_and_enqueue_exec_completion(&self) -> bool {

@@ -57,7 +57,7 @@ mod tests;
 
 /// Why input is starting a turn; shared by admission and input delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TurnStartKind {
+pub(crate) enum TurnStartKind {
     User,
     Automatic,
     Recovery,
@@ -455,6 +455,27 @@ async fn start_if_idle(
         });
     }
 
+    let start_trigger = start.turn_trigger.clone();
+    let goal_admission =
+        super::goal_admission::check_goal_admission(session, kind, start_trigger.as_deref());
+    if let Some(reason) = goal_admission.reason {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted { reason });
+    }
+    let goal_admitted_revision = goal_admission.admitted_revision;
+
+    // Automatic goal continuation carries no persistent settings delta:
+    // production sends default thread settings (runtime.rs). Any supplied
+    // delta is ignored so a later gate rejection leaves thread settings and
+    // notifications byte-identical (rejection without effects). Start options
+    // are turn-only and still apply to the new turn context.
+    let thread_settings = if goal_admitted_revision.is_some() {
+        ThreadSettingsOverrides::default()
+    } else {
+        thread_settings
+    };
+
     let settings = match PreparedTurnInputSettings::prepare(session, thread_settings, start).await {
         Ok(settings) => settings,
         Err(error) => {
@@ -511,14 +532,43 @@ async fn start_if_idle(
             }
         }
     }
-    session
+    // Late revision recheck (fast path): a receipt transition may have landed
+    // during the awaited preparation window after the early admission check.
+    // Recompare before starting; on mismatch abandon cleanly with no ownerless
+    // reservation. The early check already consumed any ticket exactly once,
+    // per AC4. The authoritative check is the linearization point inside
+    // `start_task`, which catches transitions landing in its own awaited
+    // prefix as well.
+    if let Some(reason) =
+        super::goal_admission::recheck_goal_admission_before_start(session, goal_admitted_revision)
+    {
+        session.clear_reserved_idle_turn(&turn_state).await;
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted { reason });
+    }
+    let started = session
         .start_task(
             turn_context,
             task_input,
             RegularTask::new(),
             TurnStartClaim::AnyVacancy,
+            goal_admitted_revision,
         )
         .await;
+    if !started {
+        // AnyVacancy never loses its reservation: `false` here means the
+        // linearization-point revision check rejected an automatic goal start.
+        // `start_task` already cleared the reservation; no settings were
+        // committed for this path (see above), so no undo is needed.
+        debug_assert!(
+            goal_admitted_revision.is_some(),
+            "only a gated goal start can refuse an AnyVacancy claim",
+        );
+        session.maybe_start_turn_for_pending_work().await;
+        return Ok(TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        });
+    }
     Ok(TurnInputSubmission::Started {
         turn_id: submission_id,
     })
@@ -565,11 +615,6 @@ async fn steer(
 }
 
 impl Session {
-    /// Called under the active-turn lock before running any task or lifecycle callback.
-    pub(crate) async fn record_started_turn(&self, turn_id: &str) {
-        self.state.lock().await.last_started_turn_id = Some(turn_id.to_string());
-    }
-
     pub(crate) async fn route_realtime_text_input(
         self: &Arc<Self>,
         text: String,
