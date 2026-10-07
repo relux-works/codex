@@ -105,7 +105,7 @@ impl PendingWorkSnapshot {
 
     /// Reports whether no pending work exists in this snapshot.
     pub fn is_empty(&self) -> bool {
-        self.armed.is_empty() && self.queued.is_empty() && self.leased.is_empty()
+        self.queued.is_empty() && self.leased.is_empty()
     }
 
     /// Counts pending receipts across all states.
