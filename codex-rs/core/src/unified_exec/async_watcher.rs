@@ -10,6 +10,7 @@ use tokio::time::Sleep;
 use super::ExitWatcherReceiptHook;
 use super::SharedPluginMetricsSidecar;
 use super::UnifiedExecContext;
+use super::completion_receipt::ExitPublicationOutcome;
 use super::completion_receipt::TerminalCompletion;
 use super::process::OutputBuffers;
 use super::process::OutputHandles;
@@ -206,11 +207,15 @@ pub(crate) fn spawn_exit_watcher(
                     timed_out: process.timed_out(),
                 },
             };
-            if hook
+            let publication = hook
                 .store
-                .publish_exit(hook.receipt_id, &hook.owner, completion)
-                .is_ok()
-            {
+                .publish_exit(hook.receipt_id, &hook.owner, completion);
+            // A retained exit only feeds the arm/inline rendezvous: the arm
+            // path enqueues the wake when it observes the raced exit, and the
+            // inline path drops this retention with the slot. Only a queued
+            // exit earns a mailbox entry here.
+            let queue_wake = matches!(publication, Ok(ExitPublicationOutcome::Queued));
+            if publication.is_ok() {
                 let (transcript, omitted_bytes) = {
                     let guard = output_buffer.lock().await;
                     (
@@ -224,6 +229,20 @@ pub(crate) fn spawn_exit_watcher(
                     transcript,
                     omitted_bytes,
                 );
+                if queue_wake {
+                    session_ref
+                        .services
+                        .unified_exec_manager
+                        .enqueue_published_completion(
+                            &session_ref,
+                            hook.receipt_id,
+                            &hook.owner,
+                            completion,
+                            process_id,
+                            failure_message.clone(),
+                        )
+                        .await;
+                }
             }
         }
 

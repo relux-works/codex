@@ -77,6 +77,7 @@ mod deprecation_notice;
 mod direct_tool_metadata;
 mod exec;
 mod exec_completion;
+mod exec_notification;
 mod exec_policy;
 #[cfg(not(target_os = "windows"))]
 mod extension_sandbox;

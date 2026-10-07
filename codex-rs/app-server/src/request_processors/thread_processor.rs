@@ -24,6 +24,7 @@ use codex_app_server_protocol::ThreadSectionAppearance;
 use codex_app_server_protocol::ThreadSectionMoveParams;
 use codex_app_server_protocol::ThreadSectionMoveResponse;
 use codex_config::types::WindowsSandboxModeToml;
+use codex_extension_api::AsyncNotificationSupport;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::ThreadIdleCause;
 use codex_protocol::SanitizedGitUrl;
@@ -1467,6 +1468,13 @@ impl ThreadRequestProcessor {
         if !selected_capability_roots.is_empty() {
             thread_extension_init.insert(selected_capability_roots);
         }
+        // Seed the host async-notification decision for this root thread.
+        // Headless exec (and its descendants via explicit inheritance) stays
+        // unavailable; only verified persistent hosts advertise completion
+        // wakes. Children never consult a session source for this.
+        thread_extension_init.insert(AsyncNotificationSupport::for_host_session_source(
+            &listener_task_context.thread_manager.session_source(),
+        ));
         let mut start_options = StartThreadOptions::new(config);
         let reserved_thread_id = if start_options.config.ephemeral {
             None

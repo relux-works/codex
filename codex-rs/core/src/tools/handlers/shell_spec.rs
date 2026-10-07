@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 pub struct CommandToolOptions {
     pub allow_login_shell: bool,
     pub exec_permission_approvals_enabled: bool,
+    pub async_notifications_available: bool,
 }
 
 #[cfg(test)]
@@ -19,6 +20,15 @@ pub fn create_exec_command_tool(options: CommandToolOptions) -> ToolSpec {
         /*include_shell_parameter*/ true,
         /*include_windows_shell_guidance*/ cfg!(windows),
     )
+}
+
+/// Description suffix for `exec_command` on hosts that can promise a wake.
+///
+/// States exactly what is promised: a wake on exit only when `notify_on_exit`
+/// was accepted, and that release disarms without killing. No wait/end-turn
+/// guidance is promised here; that depends on a later pacing stage.
+fn async_notification_description_suffix() -> &'static str {
+    " When notify_on_exit is accepted, the runtime delivers completion after the process exits; use exec_notification to read the retained terminal output or release the subscription without terminating the process. A session ID alone does not promise a wake."
 }
 
 pub(crate) fn create_exec_command_tool_with_environment_id(
@@ -62,6 +72,15 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             )),
         ),
     ]);
+    if options.async_notifications_available {
+        properties.insert(
+            "notify_on_exit".to_string(),
+            JsonSchema::boolean(Some(
+                "Request a completion wake when the process exits. The subscription is acknowledged with a receipt ID in the tool response; without that acknowledgment no wake is promised. Defaults to false."
+                    .to_string(),
+            )),
+        );
+    }
     if include_shell_parameter {
         properties.insert(
             "shell".to_string(),
@@ -92,17 +111,24 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         options.exec_permission_approvals_enabled,
     ));
 
+    let mut description = if include_windows_shell_guidance {
+        format!(
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
+            windows_shell_guidance()
+        )
+    } else {
+        "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+            .to_string()
+    };
+    // Incapable hosts keep the base description byte-identical: no wake is
+    // promised there.
+    if options.async_notifications_available {
+        description.push_str(async_notification_description_suffix());
+    }
+
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
-        description: if include_windows_shell_guidance {
-            format!(
-                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
-                windows_shell_guidance()
-            )
-        } else {
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
-                .to_string()
-        },
+        description,
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
@@ -155,6 +181,59 @@ pub fn create_write_stdin_tool() -> ToolSpec {
             Some(false.into()),
         ),
         output_schema: Some(unified_exec_output_schema().into()),
+    })
+}
+
+/// Default output token budget for `exec_notification` reads.
+pub(crate) const EXEC_NOTIFICATION_READ_DEFAULT_MAX_TOKENS: usize = 2_000;
+
+/// Maximum output token budget for `exec_notification` reads.
+///
+/// Keeps every read response strictly under the 10K-token per-item bound with
+/// room for the response header.
+pub(crate) const EXEC_NOTIFICATION_READ_MAX_TOKENS: usize = 9_000;
+
+pub fn create_exec_notification_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "action".to_string(),
+            JsonSchema::string_enum(
+                vec![json!("read"), json!("release")],
+                Some(
+                    "read returns the retained terminal output without waiting; release disarms the completion wake without terminating the process."
+                        .to_string(),
+                ),
+            ),
+        ),
+        (
+            "receipt_id".to_string(),
+            JsonSchema::string(Some(
+                "Receipt ID acknowledged by exec_command when the notify_on_exit subscription was accepted."
+                    .to_string(),
+            )),
+        ),
+        (
+            "max_output_tokens".to_string(),
+            JsonSchema::integer(Some(
+                "Output token budget for read. Defaults to 2000 tokens; capped below 10000 tokens per response."
+                    .to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "exec_notification".to_string(),
+        description:
+            "Reads retained terminal output for an acknowledged exec completion subscription, or releases the subscription. Releasing disarms the completion wake without terminating the process."
+                .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["action".to_string(), "receipt_id".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
     })
 }
 

@@ -167,6 +167,27 @@ impl RetentionState {
         RetentionLookup::Absent
     }
 
+    /// Returns retained `(bytes, omitted_bytes)` without cloning output.
+    ///
+    /// Used to snapshot retention metadata for the mailbox completion entry.
+    /// Only entries owned by `owner` report sizes; anything else (including
+    /// retired markers and absent entries) reports `None`.
+    pub(crate) fn retained_sizes(
+        &self,
+        receipt_id: ReceiptId,
+        owner: &ReceiptOwner,
+    ) -> Option<(u64, u64)> {
+        if let Some(pending) = self.pending.get(&receipt_id) {
+            return (pending.owner == *owner)
+                .then_some((pending.bytes.len() as u64, pending.omitted_bytes as u64));
+        }
+        if let Some(sampled) = self.sampled.get(&receipt_id) {
+            return (sampled.owner == *owner)
+                .then_some((sampled.bytes.len() as u64, sampled.omitted_bytes as u64));
+        }
+        None
+    }
+
     pub(crate) fn sampled_count(&self) -> usize {
         self.sampled.len()
     }

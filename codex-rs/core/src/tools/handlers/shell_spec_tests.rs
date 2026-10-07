@@ -18,6 +18,7 @@ fn exec_command_tool_matches_expected_spec() {
     let tool = create_exec_command_tool(CommandToolOptions {
         allow_login_shell: true,
         exec_permission_approvals_enabled: false,
+        async_notifications_available: false,
     });
 
     let description = if cfg!(windows) {
@@ -104,6 +105,7 @@ fn exec_command_tool_can_hide_shell_parameter() {
         CommandToolOptions {
             allow_login_shell: true,
             exec_permission_approvals_enabled: false,
+            async_notifications_available: false,
         },
         /*include_environment_id*/ false,
         /*include_shell_parameter*/ false,
@@ -200,5 +202,94 @@ fn request_permissions_tool_includes_full_permission_schema() {
             ),
             output_schema: None,
         })
+    );
+}
+
+fn command_options(async_notifications_available: bool) -> CommandToolOptions {
+    CommandToolOptions {
+        allow_login_shell: false,
+        exec_permission_approvals_enabled: false,
+        async_notifications_available,
+    }
+}
+
+fn spec_description(tool: &ToolSpec) -> &str {
+    match tool {
+        ToolSpec::Function(spec) => spec.description.as_str(),
+        ToolSpec::Namespace(_)
+        | ToolSpec::ToolSearch { .. }
+        | ToolSpec::WebSearch { .. }
+        | ToolSpec::Freeform(_) => panic!("expected a function spec"),
+    }
+}
+
+#[test]
+fn exec_command_schema_gates_notify_on_exit_on_host_capability() {
+    let available = create_exec_command_tool(command_options(true));
+    assert!(has_parameter(&available, "notify_on_exit"));
+    let description = spec_description(&available);
+    assert!(
+        description.contains("notify_on_exit")
+            && description.contains("without terminating the process")
+            && description.contains("A session ID alone does not promise a wake"),
+        "available description must state the wake promise exactly: {description}"
+    );
+    assert!(
+        !description.contains("end the turn"),
+        "no-wait/end-turn guidance is deferred: {description}"
+    );
+
+    let unavailable = create_exec_command_tool(command_options(false));
+    assert!(!has_parameter(&unavailable, "notify_on_exit"));
+    let base_description = if cfg!(windows) {
+        format!(
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.{}",
+            windows_shell_guidance_description()
+        )
+    } else {
+        "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+            .to_string()
+    };
+    assert_eq!(
+        spec_description(&unavailable),
+        base_description.as_str(),
+        "incapable hosts keep the base description with no wake promise"
+    );
+    assert!(
+        !spec_description(&unavailable).contains("notify_on_exit"),
+        "incapable hosts promise no wake"
+    );
+}
+
+#[test]
+fn exec_notification_tool_matches_expected_spec() {
+    let tool = create_exec_notification_tool();
+
+    assert!(has_parameter(&tool, "action"));
+    assert!(has_parameter(&tool, "receipt_id"));
+    assert!(has_parameter(&tool, "max_output_tokens"));
+    let description = spec_description(&tool);
+    assert!(
+        description
+            .contains("Releasing disarms the completion wake without terminating the process"),
+        "release must promise disarm-without-kill: {description}"
+    );
+
+    let parameters = serde_json::to_value(&tool)
+        .expect("tool spec should serialize")
+        .pointer("/parameters")
+        .expect("function spec should have parameters")
+        .clone();
+    assert_eq!(
+        parameters
+            .pointer("/required")
+            .expect("required should exist"),
+        &serde_json::json!(["action", "receipt_id"])
+    );
+    assert_eq!(
+        parameters
+            .pointer("/properties/action/enum")
+            .expect("action should be an enum"),
+        &serde_json::json!(["read", "release"])
     );
 }
