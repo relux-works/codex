@@ -51,7 +51,7 @@ pub(crate) fn check_goal_admission(
     kind: TurnStartKind,
     turn_trigger: Option<&str>,
 ) -> GoalAdmissionOutcome {
-    if kind != TurnStartKind::Automatic || turn_trigger != Some("goal") {
+    if kind != TurnStartKind::Automatic {
         return GoalAdmissionOutcome {
             reason: None,
             admitted_revision: None,
