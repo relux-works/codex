@@ -26,6 +26,8 @@ use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::test_codex::local_selections;
 use pretty_assertions::assert_eq;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use test_case::test_case;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
@@ -1186,4 +1188,687 @@ async fn suspended_runtime_entry_does_not_block_start_if_idle() {
     .expect("suspended runtime must not block idle starts");
     assert!(matches!(submission, TurnInputSubmission::Started { .. }));
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+fn install_pending_work_gate(
+    session: &Arc<Session>,
+    expected_revision: Option<std::sync::Arc<std::sync::Mutex<Option<u64>>>>,
+) {
+    session.services.thread_extension_data.insert(
+        codex_extension_api::GoalBackgroundWaitAdmission::new(move |outcome| {
+            let snapshot = match outcome {
+                Ok(snapshot) => snapshot,
+                Err(_) => return codex_extension_api::GoalAdmissionDecision::Wait,
+            };
+            if let Some(expected) = expected_revision.as_ref()
+                && *expected.lock().expect("expected revision") != Some(snapshot.revision())
+            {
+                return codex_extension_api::GoalAdmissionDecision::Wait;
+            }
+            if snapshot.is_empty() {
+                codex_extension_api::GoalAdmissionDecision::Allow
+            } else {
+                codex_extension_api::GoalAdmissionDecision::Wait
+            }
+        }),
+    );
+}
+
+fn arm_session_receipt(
+    session: &Arc<Session>,
+    call_id: &str,
+) -> (
+    crate::unified_exec::completion_receipt::ReceiptId,
+    crate::unified_exec::completion_receipt::ReceiptOwner,
+) {
+    let store = session.services.unified_exec_manager.receipt_store();
+    let owner = crate::unified_exec::completion_receipt::ReceiptOwner::new(
+        session.thread_id,
+        /*runtime_generation*/ 1,
+        call_id,
+    )
+    .expect("test owner should be valid");
+    let receipt_id = store.reserve(owner.clone()).expect("reserve");
+    let outcome = store
+        .resolve_initial_response(
+            receipt_id,
+            &owner,
+            crate::unified_exec::completion_receipt::InitialResponseDecision::Arm,
+        )
+        .expect("arm");
+    assert_eq!(
+        outcome,
+        crate::unified_exec::completion_receipt::InitialResponseOutcome::Armed
+    );
+    (receipt_id, owner)
+}
+
+#[tokio::test]
+async fn goal_background_wait_blocks_goal_but_admits_user_and_followup() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    install_pending_work_gate(&session, /*expected_revision*/ None);
+    let (_receipt_id, _owner) = arm_session_receipt(&session, "call-fairness");
+
+    let goal = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-gated".to_string(),
+    )
+    .await
+    .expect("goal admission should return a typed rejection");
+    assert_eq!(
+        goal,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        }
+    );
+    assert!(session.active_turn.lock().await.is_none());
+
+    let user = handle(
+        &session,
+        TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "user message".to_string(),
+            text_elements: Vec::new(),
+        }]),
+        TurnInputMode::StartIfIdle,
+        "user-admitted".to_string(),
+    )
+    .await
+    .expect("user input should bypass the goal gate");
+    assert!(matches!(user, TurnInputSubmission::Started { .. }));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let followup = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::root(),
+        Vec::new(),
+        "follow-up".to_string(),
+        /*trigger_turn*/ false,
+    );
+    let followup_submission = handle(
+        &session,
+        TurnInputRequest::new(SubmittedTurnInput::InterAgentCommunication(followup)),
+        TurnInputMode::StartIfIdle,
+        "followup-admitted".to_string(),
+    )
+    .await
+    .expect("follow-up should bypass the goal gate");
+    assert!(
+        matches!(followup_submission, TurnInputSubmission::Started { .. }),
+        "follow-up admission must not consult the goal gate: {followup_submission:?}"
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn goal_background_wait_allows_when_empty_and_after_release() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    install_pending_work_gate(&session, /*expected_revision*/ None);
+
+    let empty = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-empty".to_string(),
+    )
+    .await
+    .expect("empty snapshot should allow goal continuation");
+    assert!(matches!(empty, TurnInputSubmission::Started { .. }));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let (receipt_id, owner) = arm_session_receipt(&session, "call-release");
+    let gated = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-gated-before-release".to_string(),
+    )
+    .await
+    .expect("pending work should gate goal continuation");
+    assert_eq!(
+        gated,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        }
+    );
+
+    session
+        .services
+        .unified_exec_manager
+        .receipt_store()
+        .cancel(
+            receipt_id,
+            &owner,
+            crate::unified_exec::completion_receipt::CancellationReason::Released,
+        )
+        .expect("release disarms without killing");
+    let released = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-after-release".to_string(),
+    )
+    .await
+    .expect("release should reopen the gate");
+    assert!(matches!(released, TurnInputSubmission::Started { .. }));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn goal_background_wait_treats_read_failure_as_wait() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    install_pending_work_gate(&session, /*expected_revision*/ None);
+    let store = session.services.unified_exec_manager.receipt_store();
+    let outcome = store.test_with_held_lock(|| {
+        crate::session::goal_admission::check_goal_admission(
+            session.as_ref(),
+            TurnStartKind::Automatic,
+            Some("goal"),
+        )
+    });
+    assert_eq!(outcome.reason, Some(NotSubmittedReason::GoalBackgroundWait));
+    assert_eq!(outcome.admitted_revision, None);
+}
+
+#[tokio::test]
+async fn goal_background_wait_ignores_non_goal_triggers() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    session.services.thread_extension_data.insert(
+        codex_extension_api::GoalBackgroundWaitAdmission::new(|_| {
+            codex_extension_api::GoalAdmissionDecision::Wait
+        }),
+    );
+    let (_receipt_id, _owner) = arm_session_receipt(&session, "call-trigger-scope");
+
+    let exec_wake = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(user_message(
+        "exec completion wake",
+    )))
+    .on_start(TurnStartOptions {
+        turn_trigger: Some("exec_completion".to_string()),
+        ..Default::default()
+    });
+    let submission = handle(
+        &session,
+        exec_wake,
+        TurnInputMode::StartIfIdle,
+        "exec-wake-bypasses".to_string(),
+    )
+    .await
+    .expect("non-goal triggers must bypass the gate");
+    assert!(
+        matches!(submission, TurnInputSubmission::Started { .. }),
+        "exec completion must bypass the goal gate: {submission:?}"
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let goal = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-still-gated".to_string(),
+    )
+    .await
+    .expect("goal should still consult the gate");
+    assert_eq!(
+        goal,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        }
+    );
+}
+
+#[tokio::test]
+async fn goal_background_wait_revision_recheck_catches_transition() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let before = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("initial snapshot should read");
+    assert!(before.is_empty());
+    let expected = std::sync::Arc::new(std::sync::Mutex::new(Some(before.revision())));
+    install_pending_work_gate(&session, Some(std::sync::Arc::clone(&expected)));
+
+    let (receipt_id, owner) = arm_session_receipt(&session, "call-race");
+    let after = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("snapshot after arm should read");
+    assert!(!after.is_empty());
+    assert_ne!(after.revision(), before.revision());
+
+    let gated = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-race".to_string(),
+    )
+    .await
+    .expect("revision change should return a typed rejection");
+    assert_eq!(
+        gated,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        }
+    );
+
+    session
+        .services
+        .unified_exec_manager
+        .receipt_store()
+        .cancel(
+            receipt_id,
+            &owner,
+            crate::unified_exec::completion_receipt::CancellationReason::Released,
+        )
+        .expect("cancel for empty-but-bumped revision");
+    let empty_bumped = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("snapshot after cancel should read");
+    assert!(empty_bumped.is_empty());
+    assert_ne!(empty_bumped.revision(), before.revision());
+
+    let stale = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-stale-revision".to_string(),
+    )
+    .await
+    .expect("stale revision should still reject when empty");
+    assert_eq!(
+        stale,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        },
+        "revision recheck must reject even when the snapshot is empty again"
+    );
+}
+
+#[tokio::test]
+async fn receipt_armed_after_admission_blocks_automatic_start() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    // Arm deterministically inside the early admission checker. The snapshot
+    // was already read (empty, revision R) before the checker runs, so arming
+    // here places the transition after the early snapshot read and before the
+    // late fast-path recheck, i.e. in the preparation window. No locks: the
+    // pre-admission `collaboration_mode` check also needs the state lock, so
+    // holding it would block admission itself.
+    let session_for_checker = Arc::clone(&session);
+    let armed = Arc::new(AtomicBool::new(false));
+    let armed_cb = Arc::clone(&armed);
+    session.services.thread_extension_data.insert(
+        codex_extension_api::GoalBackgroundWaitAdmission::new(move |outcome| {
+            let snapshot = match outcome {
+                Ok(snapshot) => snapshot,
+                Err(_) => return codex_extension_api::GoalAdmissionDecision::Wait,
+            };
+            if snapshot.is_empty() && !armed_cb.swap(true, Ordering::SeqCst) {
+                let (_receipt_id, _owner) =
+                    arm_session_receipt(&session_for_checker, "call-late-race");
+                // Allow on the stale empty snapshot; the late recheck (or the
+                // linearization point) must catch the revision bump.
+                return codex_extension_api::GoalAdmissionDecision::Allow;
+            }
+            if snapshot.is_empty() {
+                codex_extension_api::GoalAdmissionDecision::Allow
+            } else {
+                codex_extension_api::GoalAdmissionDecision::Wait
+            }
+        }),
+    );
+
+    let submission = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-late-race".to_string(),
+    )
+    .await
+    .expect("late revision mismatch must return a typed rejection");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    assert!(
+        armed.load(Ordering::SeqCst),
+        "checker must arm in the window"
+    );
+    let after = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("snapshot after arm should read");
+    assert!(!after.is_empty(), "armed receipt must be pending");
+    assert_eq!(
+        submission,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        },
+        "receipt transition after admission must block the automatic start"
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+fn install_allow_empty_goal_gate(session: &Arc<Session>) {
+    session.services.thread_extension_data.insert(
+        codex_extension_api::GoalBackgroundWaitAdmission::new(|outcome| match outcome {
+            Ok(snapshot) if snapshot.is_empty() => {
+                codex_extension_api::GoalAdmissionDecision::Allow
+            }
+            _ => codex_extension_api::GoalAdmissionDecision::Wait,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn receipt_armed_inside_start_task_blocks_automatic_start() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    install_allow_empty_goal_gate(&session);
+    let gate = session
+        .services
+        .thread_extension_data
+        .get_or_init(crate::codex_thread::TestGoalStartTaskGate::new);
+
+    let session_for_handle = Arc::clone(&session);
+    let handle_task = tokio::spawn(async move {
+        handle(
+            &session_for_handle,
+            goal_continuation_request(),
+            TurnInputMode::StartIfIdle,
+            "goal-residual-race".to_string(),
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_arrived())
+        .await
+        .expect("goal start must reach the pre-publication pause");
+
+    // Arm in the residual window inside `start_task`, after the late fast-path
+    // recheck and before the linearization-point publication.
+    let (_receipt_id, _owner) = arm_session_receipt(&session, "call-residual-race");
+    gate.release();
+
+    let submission = handle_task
+        .await
+        .expect("handle task must complete")
+        .expect("linearization rejection must return a typed rejection");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    assert_eq!(
+        submission,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        },
+        "receipt armed inside start_task must block the automatic start"
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn arm_after_publication_allows_turn_and_keeps_receipt_pending() {
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    install_allow_empty_goal_gate(&session);
+
+    let session_for_handle = Arc::clone(&session);
+    let handle_task = tokio::spawn(async move {
+        handle(
+            &session_for_handle,
+            goal_continuation_request(),
+            TurnInputMode::StartIfIdle,
+            "goal-after-publish".to_string(),
+        )
+        .await
+    });
+
+    for _ in 0..1000 {
+        let published = session.state.lock().await.last_started_turn_id.as_deref()
+            == Some("goal-after-publish");
+        if published {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        session.state.lock().await.last_started_turn_id.as_deref(),
+        Some("goal-after-publish"),
+        "turn must publish before the late Arm",
+    );
+
+    // Arm just after publication: by definition work arriving after the turn
+    // started, which is legitimate. The turn runs and the receipt stays
+    // pending for later delivery.
+    let (_receipt_id, _owner) = arm_session_receipt(&session, "call-after-publish");
+
+    let submission = handle_task
+        .await
+        .expect("handle task must complete")
+        .expect("post-publish Arm must not reject the started turn");
+    assert!(
+        matches!(submission, TurnInputSubmission::Started { .. }),
+        "turn published before the Arm must run: {submission:?}",
+    );
+    let snapshot = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("snapshot after late Arm should read");
+    assert!(!snapshot.is_empty(), "late-armed receipt must stay pending",);
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|turn| turn.task.is_some()),
+        "published turn must still be running",
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn late_goal_rejection_leaves_thread_settings_unchanged() {
+    let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
+    install_allow_empty_goal_gate(&session);
+    let gate = session
+        .services
+        .thread_extension_data
+        .get_or_init(crate::codex_thread::TestGoalStartTaskGate::new);
+
+    let before_settings = session.thread_settings_snapshot().await;
+    while rx.try_recv().is_ok() {}
+
+    // Gated goal starts ignore persistent deltas; this High-effort patch must
+    // not commit when the linearization point rejects the start.
+    let request = goal_continuation_request().with_thread_settings(ThreadSettingsOverrides {
+        effort: Some(Some(ReasoningEffort::High)),
+        ..Default::default()
+    });
+    let submission_id = "goal-reject-no-effects".to_string();
+    let session_for_handle = Arc::clone(&session);
+    let submission_id_for_handle = submission_id.clone();
+    let handle_task = tokio::spawn(async move {
+        handle(
+            &session_for_handle,
+            request,
+            TurnInputMode::StartIfIdle,
+            submission_id_for_handle,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.wait_arrived())
+        .await
+        .expect("goal start must reach the pre-publication pause");
+    let (_receipt_id, _owner) = arm_session_receipt(&session, "call-reject-no-effects");
+    gate.release();
+
+    let submission = handle_task
+        .await
+        .expect("handle task must complete")
+        .expect("linearization rejection must return a typed rejection");
+    assert_eq!(
+        submission,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::GoalBackgroundWait,
+        },
+    );
+    assert_eq!(session.thread_settings_snapshot().await, before_settings,);
+    assert!(session.active_turn.lock().await.is_none());
+    let mut saw_submission = false;
+    while let Ok(event) = rx.try_recv() {
+        if event.id == submission_id {
+            saw_submission = true;
+        }
+    }
+    assert!(
+        !saw_submission,
+        "rejected goal start must emit no notification for its submission",
+    );
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn goal_publish_serialized_with_concurrent_arm() {
+    use std::time::Duration;
+
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    install_allow_empty_goal_gate(&session);
+
+    // Reserve without arming: Reserved is not pending, so the early gate
+    // Allows and the start reaches the publication window. The racing Arm
+    // (Reserved -> Armed) then hits that window from a blocking thread.
+    let owner = crate::unified_exec::completion_receipt::ReceiptOwner::new(
+        session.thread_id,
+        /*runtime_generation*/ 1,
+        "call-publish-race",
+    )
+    .expect("test owner should be valid");
+    let receipt_id = session
+        .services
+        .unified_exec_manager
+        .receipt_store()
+        .reserve(owner.clone())
+        .expect("reserve");
+
+    let gate = session
+        .services
+        .thread_extension_data
+        .get_or_init(crate::codex_thread::TestGoalPublishGate::new);
+
+    let session_for_arm = Arc::clone(&session);
+    let gate_for_arm = Arc::clone(&gate);
+    let owner_for_arm = owner.clone();
+    let arm_task = tokio::task::spawn_blocking(move || {
+        assert!(
+            gate_for_arm.wait_compared(Duration::from_secs(5)),
+            "publication must enter the window"
+        );
+        gate_for_arm.signal_attempting();
+        let outcome = session_for_arm
+            .services
+            .unified_exec_manager
+            .receipt_store()
+            .resolve_initial_response(
+                receipt_id,
+                &owner_for_arm,
+                crate::unified_exec::completion_receipt::InitialResponseDecision::Arm,
+            )
+            .expect("racing Arm must succeed");
+        assert_eq!(
+            outcome,
+            crate::unified_exec::completion_receipt::InitialResponseOutcome::Armed
+        );
+        gate_for_arm.record_arm_seq();
+        gate_for_arm.signal_done();
+    });
+
+    let submission = handle(
+        &session,
+        goal_continuation_request(),
+        TurnInputMode::StartIfIdle,
+        "goal-publish-race".to_string(),
+    )
+    .await
+    .expect("serialized publication must return a submission");
+    arm_task.await.expect("arm thread must complete");
+
+    // With serialization the Arm blocks on the store lock while publication
+    // holds it, so publication wins the shared sequence; without it (rev-4
+    // shape) the Arm completes first and publication writes stale.
+    assert_ne!(gate.publish_seq(), u64::MAX, "publication gate must fire");
+    assert_ne!(gate.arm_seq(), u64::MAX, "racing Arm must complete");
+    assert!(
+        gate.publish_seq() < gate.arm_seq(),
+        "publication must win over a racing Arm: publish={} arm={}",
+        gate.publish_seq(),
+        gate.arm_seq()
+    );
+    assert!(
+        matches!(submission, TurnInputSubmission::Started { .. }),
+        "post-window Arm is legitimate post-start work: {submission:?}"
+    );
+    let snapshot = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("snapshot after late Arm should read");
+    assert!(!snapshot.is_empty(), "late-armed receipt must stay pending");
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn goal_publish_rejects_safe_when_store_contended() {
+    use std::time::Duration;
+
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let revision = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("initial snapshot should read")
+        .revision();
+
+    // Hold the store lock on a blocking thread: publication must fail safe
+    // via try_lock, never block the executor or publish stale. A blocking
+    // inner lock here would deadlock and trip the timeout instead.
+    let session_for_holder = Arc::clone(&session);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = tokio::task::spawn_blocking(move || {
+        session_for_holder
+            .services
+            .unified_exec_manager
+            .receipt_store()
+            .test_with_held_lock(|| {
+                locked_tx.send(()).expect("signal locked");
+                release_rx.recv().expect("wait release");
+            });
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("holder must take the store lock");
+    let published = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.publish_goal_turn_if_revision_matches("t-store-contended", Some(revision)),
+    )
+    .await
+    .expect("contended publication must not deadlock");
+    assert!(!published, "contended store must reject safe, not publish");
+    assert!(
+        session.state.lock().await.last_started_turn_id.is_none(),
+        "rejected publish must not write"
+    );
+    release_tx.send(()).expect("release holder");
+    holder.await.expect("holder must finish");
+}
+
+#[tokio::test]
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "intentional mailbox contention: the held lock must span the async publication attempt"
+)]
+async fn goal_publish_rejects_safe_when_mailbox_contended() {
+    use std::time::Duration;
+
+    let (session, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    let revision = crate::session::pending_work::try_read_snapshot(session.as_ref())
+        .expect("initial snapshot should read")
+        .revision();
+
+    let _held = session.input_queue.test_hold_runtime_lock().await;
+    let published = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.publish_goal_turn_if_revision_matches("t-mailbox-contended", Some(revision)),
+    )
+    .await
+    .expect("contended publication must not deadlock");
+    assert!(
+        !published,
+        "contended mailbox must reject safe, not publish"
+    );
+    assert!(
+        session.state.lock().await.last_started_turn_id.is_none(),
+        "rejected publish must not write"
+    );
 }

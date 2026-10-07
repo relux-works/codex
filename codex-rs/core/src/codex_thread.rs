@@ -274,6 +274,164 @@ impl TestWakeLeaseGate {
     }
 }
 
+/// Test-only gate pausing an automatic goal start inside `start_task`.
+///
+/// A suite arms one gate to deterministically interleave a receipt Arm with
+/// the residual window after the late admission recheck and before turn
+/// publication: the starting task signals arrival once it holds the active
+/// reservation inside `start_task` and waits for release, while the suite
+/// arms a receipt and then releases it. Production inserts no gate; both
+/// hooks are no-ops when none is present. Only automatic goal continuation
+/// with an admitted work revision consults this gate.
+#[doc(hidden)]
+pub struct TestGoalStartTaskGate {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl TestGoalStartTaskGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            arrived: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Signals that a gated goal start reached the pre-publication pause.
+    pub(crate) fn signal_arrived(&self) {
+        self.arrived.notify_one();
+    }
+
+    /// Waits for the suite to release the gated goal start.
+    pub(crate) async fn wait_release(&self) {
+        self.release.notified().await;
+    }
+
+    /// Waits for the gated goal start to reach the pre-publication pause.
+    #[doc(hidden)]
+    pub async fn wait_arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    /// Releases the gated goal start.
+    #[doc(hidden)]
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+/// Synchronous gate inside the serialized admission-publication section.
+///
+/// While the publication holds `Session.state`, the receipt-store lock, and
+/// the mailbox lock, it signals `compared`, waits for an OS-thread Arm to
+/// start (`attempting`) and then for its completion (`done`, short timeout).
+/// With the fix the Arm blocks on the store lock, the `done` wait times out,
+/// and publication wins; without the store lock (rev-4 shape) the Arm
+/// completes first and publication writes stale. Ordering is recorded in
+/// `publish_seq`/`arm_seq` via one shared counter (lower won). All waits are
+/// blocking `std` spins: never `.await` while the store lock is held.
+/// Production installs no gate; every hook is skipped when none is present.
+/// Only automatic goal continuation with an admitted work revision uses it.
+pub(crate) struct TestGoalPublishGate {
+    compared: std::sync::atomic::AtomicBool,
+    attempting: std::sync::atomic::AtomicBool,
+    done: std::sync::atomic::AtomicBool,
+    counter: std::sync::atomic::AtomicU64,
+    publish_seq: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    arm_seq: std::sync::atomic::AtomicU64,
+}
+
+impl TestGoalPublishGate {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self {
+            compared: std::sync::atomic::AtomicBool::new(false),
+            attempting: std::sync::atomic::AtomicBool::new(false),
+            done: std::sync::atomic::AtomicBool::new(false),
+            counter: std::sync::atomic::AtomicU64::new(0),
+            publish_seq: std::sync::atomic::AtomicU64::new(u64::MAX),
+            arm_seq: std::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
+
+    fn wait_flag(flag: &std::sync::atomic::AtomicBool, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Signals that publication compared the revision and entered the window.
+    pub(crate) fn signal_compared(&self) {
+        self.compared
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Waits for the racing Arm to start (harness liveness).
+    pub(crate) fn wait_attempting(&self, timeout: std::time::Duration) -> bool {
+        Self::wait_flag(&self.attempting, timeout)
+    }
+
+    /// Waits for the racing Arm to complete (short race window).
+    pub(crate) fn wait_done(&self, timeout: std::time::Duration) -> bool {
+        Self::wait_flag(&self.done, timeout)
+    }
+
+    /// Records publication order in the shared sequence.
+    pub(crate) fn record_publish_seq(&self) {
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.publish_seq
+            .store(seq, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Waits for publication to enter the window.
+    #[cfg(test)]
+    pub(crate) fn wait_compared(&self, timeout: std::time::Duration) -> bool {
+        Self::wait_flag(&self.compared, timeout)
+    }
+
+    /// Signals that the racing Arm is about to touch the store.
+    #[cfg(test)]
+    pub(crate) fn signal_attempting(&self) {
+        self.attempting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Signals that the racing Arm finished.
+    #[cfg(test)]
+    pub(crate) fn signal_done(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Records Arm-completion order in the shared sequence.
+    #[cfg(test)]
+    pub(crate) fn record_arm_seq(&self) {
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.arm_seq.store(seq, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Publication sequence (`u64::MAX` when the gate never fired).
+    #[cfg(test)]
+    pub(crate) fn publish_seq(&self) -> u64 {
+        self.publish_seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Arm-completion sequence (`u64::MAX` when the Arm never finished).
+    #[cfg(test)]
+    pub(crate) fn arm_seq(&self) -> u64 {
+        self.arm_seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Conduit for the bidirectional stream of messages that compose a thread
 /// (formerly called a conversation) in Codex.
 impl CodexThread {
@@ -531,6 +689,67 @@ impl CodexThread {
             .services
             .thread_extension_data
             .remove::<TestWakeLeaseGate>();
+    }
+
+    /// Arms the goal start-task gate for testing.
+    ///
+    /// Test-only: the next automatic goal start carrying an admitted work
+    /// revision pauses inside `start_task` after the late admission recheck
+    /// and before turn publication, so a suite can arm a receipt in that
+    /// residual window. Pair with [`Self::test_disarm_goal_start_task_gate`].
+    #[doc(hidden)]
+    pub async fn test_arm_goal_start_task_gate(&self) -> Arc<TestGoalStartTaskGate> {
+        self.session
+            .services
+            .thread_extension_data
+            .remove::<TestGoalStartTaskGate>();
+        self.session
+            .services
+            .thread_extension_data
+            .get_or_init(TestGoalStartTaskGate::new)
+    }
+
+    /// Disarms the goal start-task gate for testing.
+    ///
+    /// Test-only: removes the gate armed by
+    /// [`Self::test_arm_goal_start_task_gate`]. Gated hooks are no-ops once
+    /// no gate is present.
+    #[doc(hidden)]
+    pub async fn test_disarm_goal_start_task_gate(&self) {
+        self.session
+            .services
+            .thread_extension_data
+            .remove::<TestGoalStartTaskGate>();
+    }
+
+    /// Arms one exec-completion receipt without publishing an exit.
+    ///
+    /// Test-only: reserves a real completion receipt and arms it, leaving it
+    /// pending as Armed work with no runtime mailbox entry and no idle wake.
+    /// Goal background-wait suites use this to hold a stalled subscription
+    /// while paused time alone drives scheduled check-ins. Production arming
+    /// arrives with opted-in exec launches (story E).
+    #[doc(hidden)]
+    pub async fn test_arm_exec_receipt_for_background_wait(&self) -> bool {
+        use crate::unified_exec::completion_receipt::InitialResponseDecision;
+        use crate::unified_exec::completion_receipt::InitialResponseOutcome;
+        use crate::unified_exec::completion_receipt::ReceiptOwner;
+
+        let Ok(owner) = ReceiptOwner::new(
+            self.session.thread_id,
+            /*runtime_generation*/ 1,
+            format!("test-call-{}", uuid::Uuid::new_v4()),
+        ) else {
+            return false;
+        };
+        let store = self.session.services.unified_exec_manager.receipt_store();
+        let Ok(receipt_id) = store.reserve(owner.clone()) else {
+            return false;
+        };
+        matches!(
+            store.resolve_initial_response(receipt_id, &owner, InitialResponseDecision::Arm),
+            Ok(InitialResponseOutcome::Armed)
+        )
     }
 
     async fn test_reserve_and_enqueue_exec_completion(&self) -> bool {

@@ -496,6 +496,7 @@ async fn reserved_start_claims_live_bare_reservation() {
             Vec::new(),
             PendingTask,
             TurnStartClaim::Reserved(reserved),
+            /*goal_admitted_revision*/ None,
         )
         .await;
     assert!(started);
@@ -525,6 +526,7 @@ async fn reserved_start_backs_off_when_reservation_aborted() {
             Vec::new(),
             PendingTask,
             TurnStartClaim::Reserved(reserved),
+            /*goal_admitted_revision*/ None,
         )
         .await;
     assert!(!started);
@@ -554,6 +556,7 @@ async fn reserved_start_backs_off_when_turn_replaced() {
             Vec::new(),
             PendingTask,
             TurnStartClaim::Reserved(reserved),
+            /*goal_admitted_revision*/ None,
         )
         .await;
     assert!(!started);
@@ -586,6 +589,7 @@ async fn reserved_start_backs_off_when_turn_busy() {
             Vec::new(),
             PendingTask,
             TurnStartClaim::Reserved(reserved),
+            /*goal_admitted_revision*/ None,
         )
         .await;
     assert!(!started);

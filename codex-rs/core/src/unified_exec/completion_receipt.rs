@@ -363,6 +363,28 @@ impl CompletionReceiptStore {
         Ok(lists)
     }
 
+    /// Runs `f` while holding the receipt-store lock, for admission publication.
+    ///
+    /// LOCK ORDER (goal admission publication, AC7): `active_turn` (tokio, held
+    /// by the `start_task` caller) -> `Session.state` (tokio) -> receipt-store
+    /// `state` (std, here) -> runtime mailbox (tokio `try_lock`, innermost).
+    /// The store and mailbox are leaves: no receipt-store, mailbox, or
+    /// receipt-hooks method acquires `Session.state`, `active_turn`, or any
+    /// other lock while held; watchers, process hooks, and test holders call
+    /// the store without holding session locks. Inner locks use `try_lock` so
+    /// contention fails safe (the caller rejects) instead of blocking the
+    /// executor or deadlocking. Never `.await` while `f` runs.
+    pub(crate) fn try_with_locked_state<R>(
+        &self,
+        f: impl FnOnce() -> R,
+    ) -> Result<R, ReceiptError> {
+        let _guard = self.state.try_lock().map_err(|err| match err {
+            std::sync::TryLockError::Poisoned(_) => ReceiptError::LockPoisoned,
+            std::sync::TryLockError::WouldBlock => ReceiptError::LockContended,
+        })?;
+        Ok(f())
+    }
+
     /// Reserves capacity before the caller launches an opted-in process.
     pub(crate) fn reserve(&self, owner: ReceiptOwner) -> Result<ReceiptId, ReceiptError> {
         let mut state = self.lock_state()?;

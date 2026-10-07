@@ -25,6 +25,7 @@ use tracing::trace_span;
 use tracing::warn;
 
 use crate::codex_thread::BackgroundTerminalInfo;
+use crate::codex_thread::TestGoalStartTaskGate;
 use crate::codex_thread::TestWakeLeaseGate;
 use crate::config::Config;
 use crate::context::ContextualUserFragment;
@@ -320,8 +321,14 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
-        self.start_task(turn_context, input, task, TurnStartClaim::AnyVacancy)
-            .await;
+        self.start_task(
+            turn_context,
+            input,
+            task,
+            TurnStartClaim::AnyVacancy,
+            /*goal_admitted_revision*/ None,
+        )
+        .await;
     }
 
     /// Starts `task`, claiming the active turn for `claim`.
@@ -329,7 +336,10 @@ impl Session {
     /// Returns `false` leaving the session untouched when a
     /// [`TurnStartClaim::Reserved`] reservation was lost to a concurrent
     /// submission; the caller fails its leases back so a later wake retries
-    /// them. [`TurnStartClaim::AnyVacancy`] always starts.
+    /// them. [`TurnStartClaim::AnyVacancy`] always starts, except an automatic
+    /// goal continuation carrying `goal_admitted_revision`, which returns
+    /// `false` with its reservation cleared when the work revision changed
+    /// after admission (the caller reports `GoalBackgroundWait`).
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "claim, record, and drain atomically with the active reservation"
@@ -340,6 +350,7 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
         claim: TurnStartClaim,
+        goal_admitted_revision: Option<u64>,
     ) -> bool {
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -367,7 +378,35 @@ impl Session {
             let Some(turn) = claim.claim_turn(&mut active) else {
                 return false;
             };
-            self.record_started_turn(&turn_context.sub_id).await;
+            // Test-only pause for the AC7 residual window (goal path only).
+            // Production inserts no gate. The suite arms a receipt here, after
+            // the late admission recheck and before publication.
+            if goal_admitted_revision.is_some()
+                && let Some(gate) = self
+                    .services
+                    .thread_extension_data
+                    .get::<TestGoalStartTaskGate>()
+            {
+                gate.signal_arrived();
+                gate.wait_release().await;
+            }
+            // LINEARIZATION POINT for automatic goal continuation (AC7): the
+            // helper compares the admitted work revision serialized with every
+            // receipt-store and mailbox transition (active-turn held here plus
+            // session-state, store, and mailbox locks), immediately before the
+            // publication, with NO await between the comparison and the
+            // publication. See `publish_goal_turn_if_revision_matches` for the
+            // ordering rule.
+            if !self
+                .publish_goal_turn_if_revision_matches(
+                    turn_context.sub_id.as_str(),
+                    goal_admitted_revision,
+                )
+                .await
+            {
+                *active = None;
+                return false;
+            }
             let turn_state = Arc::clone(&turn.turn_state);
             // Drain under the same lock so a backed-off start drops no mail.
             let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
@@ -631,6 +670,7 @@ impl Session {
                 Vec::new(),
                 RegularTask::new(),
                 TurnStartClaim::Reserved(turn_state),
+                /*goal_admitted_revision*/ None,
             )
             .await
         {
