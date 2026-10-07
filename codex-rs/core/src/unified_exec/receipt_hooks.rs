@@ -347,10 +347,6 @@ impl UnifiedExecProcessManager {
         process_id: i32,
         failure: Option<String>,
     ) {
-        if !self.is_live_queued_receipt(receipt_id, owner) {
-            self.receipt_hooks.lock().await.retention.drop(receipt_id);
-            return;
-        }
         let retention = self
             .receipt_hooks
             .lock()
