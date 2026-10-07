@@ -2199,12 +2199,11 @@ impl ThreadManagerState {
             .get::<codex_extension_api::AsyncNotificationSupport>()
             .is_none()
         {
-            thread_extension_init.insert(
-                self.inherited_async_notification_support(
-                    parent_thread_id.or(forked_from_thread_id),
-                )
-                .await,
-            );
+            thread_extension_init.insert(if matches!(session_source, SessionSource::Exec) {
+                codex_extension_api::AsyncNotificationSupport::Unavailable
+            } else {
+                codex_extension_api::AsyncNotificationSupport::Available
+            });
         }
         // Host controllers can already be shared with live threads. Publish root settings
         // only after registration succeeds, so a failed start cannot update their tree.
