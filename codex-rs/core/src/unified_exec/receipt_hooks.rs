@@ -377,7 +377,6 @@ impl UnifiedExecProcessManager {
             )
             .await;
         if !self.is_live_queued_receipt(receipt_id, owner) {
-            self.receipt_hooks.lock().await.retention.drop(receipt_id);
             session
                 .input_queue
                 .cancel_runtime_notification(receipt_id)
