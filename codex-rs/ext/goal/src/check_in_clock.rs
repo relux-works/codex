@@ -122,13 +122,6 @@ impl CheckInTimer {
         F: Future<Output = ()> + Send + 'static,
     {
         let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot
-            .entry
-            .as_ref()
-            .is_some_and(|existing| existing.generation > generation)
-        {
-            return false;
-        }
         if let Some(old) = slot.entry.take() {
             old.handle.abort();
         }
