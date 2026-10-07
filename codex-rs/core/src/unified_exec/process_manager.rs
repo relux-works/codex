@@ -64,6 +64,7 @@ use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::completion_receipt::CancellationReason;
 use crate::unified_exec::completion_receipt::ExecCompletionMode;
 use crate::unified_exec::completion_receipt::InitialResponseDecision;
+use crate::unified_exec::completion_receipt::InitialResponseOutcome;
 use crate::unified_exec::completion_receipt::ReceiptError;
 use crate::unified_exec::completion_receipt::TerminalCompletion;
 use crate::unified_exec::generate_chunk_id;
@@ -514,13 +515,14 @@ impl UnifiedExecProcessManager {
             outcome = tracing::field::Empty,
         )
     )]
-    pub(crate) async fn exec_command(
+    pub(crate) async fn exec_command_with_completion_mode(
         &self,
         request: ExecCommandRequest,
         context: &UnifiedExecContext,
+        completion_mode: ExecCompletionMode,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let result = self
-            .exec_command_with_completion_mode(request, context, ExecCompletionMode::Default)
+            .exec_command_inner(request, context, /*completion*/ None, completion_mode)
             .await;
         let outcome = match &result {
             Ok(output) if output.process_id.is_some() => "yielded",
@@ -530,16 +532,6 @@ impl UnifiedExecProcessManager {
         };
         tracing::Span::current().record("outcome", outcome);
         result
-    }
-
-    pub(crate) async fn exec_command_with_completion_mode(
-        &self,
-        request: ExecCommandRequest,
-        context: &UnifiedExecContext,
-        completion_mode: ExecCompletionMode,
-    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-        self.exec_command_inner(request, context, /*completion*/ None, completion_mode)
-            .await
     }
 
     pub(super) async fn exec_command_inner(
@@ -799,6 +791,10 @@ impl UnifiedExecProcessManager {
             return Err(UnifiedExecError::process_failed(message));
         }
         let process_id = request.process_id;
+        // Model-visible receipt handle when the opt-in subscription armed.
+        // Every other path settles inline or fails before arming, so no wake
+        // is acknowledged there.
+        let mut armed_receipt: Option<String> = None;
         let (response_process_id, exit_code) = if process_started_alive {
             match self.refresh_process_state(process_id).await {
                 ProcessStatus::Alive {
@@ -809,12 +805,31 @@ impl UnifiedExecProcessManager {
                     if let Some((receipt_id, owner)) = opted_in_receipt.as_ref() {
                         // Arm the subscription; a concurrent exit publication
                         // already queued the completion and is equally
-                        // exactly-once.
-                        let _ = self.receipt_store.resolve_initial_response(
+                        // exactly-once. A queued exit raced arming: retention
+                        // was already inserted by the watcher, so only the
+                        // mailbox wake is still missing here.
+                        match self.receipt_store.resolve_initial_response(
                             *receipt_id,
                             owner,
                             InitialResponseDecision::Arm,
-                        );
+                        ) {
+                            Ok(InitialResponseOutcome::Armed) => {
+                                armed_receipt = Some(receipt_id.model_handle());
+                            }
+                            Ok(InitialResponseOutcome::Queued(completion)) => {
+                                armed_receipt = Some(receipt_id.model_handle());
+                                self.enqueue_published_completion(
+                                    &context.session,
+                                    *receipt_id,
+                                    owner,
+                                    completion,
+                                    process_id,
+                                    process.failure_message(),
+                                )
+                                .await;
+                            }
+                            Ok(InitialResponseOutcome::InlineResult(_)) | Err(_) => {}
+                        }
                     }
                     (Some(process_id), exit_code)
                 }
@@ -983,6 +998,7 @@ impl UnifiedExecProcessManager {
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
             hook_command: Some(request.hook_command.clone()),
+            completion_receipt: armed_receipt,
         };
 
         Ok(response)
@@ -1254,6 +1270,7 @@ impl UnifiedExecProcessManager {
             original_token_count: Some(original_token_count),
             output_omitted_bytes,
             hook_command: Some(hook_command),
+            completion_receipt: None,
         };
 
         let should_emit_interaction = !request.input.is_empty() || response.process_id.is_some();

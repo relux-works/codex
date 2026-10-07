@@ -33,10 +33,30 @@ use super::completion_receipt::TerminalCompletion;
 use super::receipt_output::RetainedOutputSnapshot;
 use super::receipt_output::RetentionLookup;
 use super::receipt_output::RetentionState;
+use crate::context::ExecCompletion;
+use crate::context::ExecOutputRetention;
+use crate::session::session::Session;
 
 pub(crate) fn next_receipt_generation() -> u64 {
     static NEXT_RECEIPT_GENERATION: AtomicU64 = AtomicU64::new(1);
     NEXT_RECEIPT_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Maximum failure detail stored on a mailbox completion entry.
+///
+/// The wake fragment truncates the whole payload to fit its own cap; this
+/// bound keeps the transient entry small regardless of the raw message.
+const MAX_COMPLETION_FAILURE_BYTES: usize = 512;
+
+fn truncate_failure_detail(message: String) -> String {
+    if message.len() <= MAX_COMPLETION_FAILURE_BYTES {
+        return message;
+    }
+    let mut end = MAX_COMPLETION_FAILURE_BYTES.min(message.len());
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", message[..end].trim_end())
 }
 
 struct ReceiptBinding {
@@ -100,6 +120,19 @@ impl ReceiptHooksState {
         let receipt_id = *self.by_process.get(&process_id)?;
         let binding = self.bindings.get(&receipt_id)?;
         Some((receipt_id, binding.owner.clone()))
+    }
+
+    /// Returns the launch owner bound to `receipt_id`, if the binding survives.
+    ///
+    /// Bindings are removed on inline settle, cancel, and release, so a live
+    /// (or sampled, still-readable) receipt resolves here while a
+    /// released/cancelled/inline receipt does not. Retention alone never
+    /// resolves: a release racing the exit watcher could otherwise resurrect
+    /// readable output for a disarmed subscription.
+    fn owner_for_receipt(&self, receipt_id: ReceiptId) -> Option<ReceiptOwner> {
+        self.bindings
+            .get(&receipt_id)
+            .map(|binding| binding.owner.clone())
     }
 
     fn binding_owner_mismatch(&self, receipt_id: ReceiptId, owner: &ReceiptOwner) -> bool {
@@ -266,6 +299,99 @@ impl UnifiedExecProcessManager {
             Err(ReceiptError::UnknownReceipt) if had_output => Ok(()),
             Err(err) => Err(err),
         }
+    }
+
+    /// Resolves the launch owner for a tool-supplied receipt id.
+    ///
+    /// `exec_notification` calls arrive under a different call id than the
+    /// launching `exec_command`, so the tool cannot rebuild the owner from its
+    /// own context: the stored launch owner is resolved from the binding and
+    /// only its thread and runtime generation are verified against the caller.
+    /// A receipt bound to another thread or generation is foreign; a receipt
+    /// with no surviving binding (unknown, released, cancelled, or inline
+    /// settled) is unknown.
+    pub(crate) async fn notification_owner_for_receipt(
+        &self,
+        receipt_id: ReceiptId,
+        context: &UnifiedExecContext,
+    ) -> Result<ReceiptOwner, ReceiptError> {
+        let owner = self
+            .receipt_hooks
+            .lock()
+            .await
+            .owner_for_receipt(receipt_id)
+            .ok_or(ReceiptError::UnknownReceipt)?;
+        if owner.thread_id() != context.session.thread_id
+            || owner.runtime_generation() != self.receipt_generation
+        {
+            return Err(ReceiptError::ForeignOwner);
+        }
+        Ok(owner)
+    }
+
+    /// Enqueues a freshly published exit for an idle wake, then wakes.
+    ///
+    /// Called by the exit watcher on `Armed -> Queued` publication and by the
+    /// initial-response arm when an exit raced arming (retention was already
+    /// inserted by the watcher in both cases). The post-enqueue liveness
+    /// recheck below is the single load-bearing guard: a pre-enqueue check
+    /// cannot close the race (a release can land between the check and the
+    /// enqueue across the await), so a receipt that is no longer live
+    /// `Queued` at recheck is cleaned up instead of skipped up front. The
+    /// cleanup drops ghost retention and cancels the just-enqueued entry, so
+    /// a disarmed receipt leaves no surviving mailbox entry, no retained
+    /// output, and no wake.
+    pub(crate) async fn enqueue_published_completion(
+        &self,
+        session: &Arc<Session>,
+        receipt_id: ReceiptId,
+        owner: &ReceiptOwner,
+        completion: TerminalCompletion,
+        process_id: i32,
+        failure: Option<String>,
+    ) {
+        let retention = self
+            .receipt_hooks
+            .lock()
+            .await
+            .retention
+            .retained_sizes(receipt_id, owner)
+            .map_or(ExecOutputRetention::Absent, |(bytes, omitted_bytes)| {
+                ExecOutputRetention::Retained {
+                    bytes,
+                    omitted_bytes,
+                }
+            });
+        session
+            .input_queue
+            .enqueue_runtime_notification(
+                receipt_id,
+                owner.clone(),
+                ExecCompletion {
+                    process_id,
+                    exit_code: completion.exit_code,
+                    timed_out: completion.timed_out,
+                    failure: failure.map(truncate_failure_detail),
+                    retention,
+                },
+            )
+            .await;
+        if !self.is_live_queued_receipt(receipt_id, owner) {
+            self.receipt_hooks.lock().await.retention.drop(receipt_id);
+            session
+                .input_queue
+                .cancel_runtime_notification(receipt_id)
+                .await;
+            return;
+        }
+        session.maybe_start_turn_for_pending_work().await;
+    }
+
+    fn is_live_queued_receipt(&self, receipt_id: ReceiptId, owner: &ReceiptOwner) -> bool {
+        matches!(
+            self.receipt_store.status(receipt_id, owner),
+            Ok(ReceiptStatus::Queued)
+        )
     }
 
     /// Reads retained output by receipt id for the matching owner.

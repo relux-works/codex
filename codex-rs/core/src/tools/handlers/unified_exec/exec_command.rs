@@ -30,7 +30,9 @@ use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
+use crate::unified_exec::completion_receipt::ExecCompletionMode;
 use crate::unified_exec::generate_chunk_id;
+use codex_extension_api::AsyncNotificationSupport;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
@@ -64,6 +66,7 @@ pub(crate) struct ExecCommandHandlerOptions {
     pub(crate) include_environment_id: bool,
     pub(crate) include_shell_parameter: bool,
     pub(crate) include_windows_shell_guidance: bool,
+    pub(crate) async_notifications: AsyncNotificationSupport,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +91,7 @@ impl Default for ExecCommandHandler {
                 include_environment_id: false,
                 include_shell_parameter: true,
                 include_windows_shell_guidance: cfg!(windows),
+                async_notifications: AsyncNotificationSupport::Unavailable,
             },
         }
     }
@@ -119,6 +123,8 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
             CommandToolOptions {
                 allow_login_shell: self.options.allow_login_shell,
                 exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
+                async_notifications_available: self.options.async_notifications.is_available()
+                    && matches!(self.lifetime, ExecCommandLifetime::Interactive),
             },
             self.options.include_environment_id,
             self.options.include_shell_parameter,
@@ -249,6 +255,26 @@ impl ExecCommandHandler {
                 "TTY execution is disabled by config; omit `tty` or set it to false.".to_string(),
             ));
         }
+        // Refuse an unpromiseable wake before any approval, permission, or
+        // execution work. Nothing is armed implicitly: only an explicit
+        // opt-in on a capable interactive host subscribes.
+        if args.notify_on_exit {
+            if matches!(self.lifetime, ExecCommandLifetime::OneShot) {
+                return Err(FunctionCallError::RespondToModel(
+                    "notify_on_exit is not supported for one-shot execution; resumable sessions are disabled here. Retry without notify_on_exit."
+                        .to_string(),
+                ));
+            }
+            if !AsyncNotificationSupport::read_from(&session.services.thread_extension_data)
+                .is_available()
+            {
+                return Err(FunctionCallError::RespondToModel(
+                    "notify_on_exit is not supported on this host; no completion wake can be promised. Retry without notify_on_exit."
+                        .to_string(),
+                ));
+            }
+        }
+        let notify_on_exit = args.notify_on_exit;
         let sandbox_permissions =
             resolve_sandbox_permissions(args.sandbox_permissions, args.justification.as_deref())?;
         let hook_command = args.cmd.clone();
@@ -401,6 +427,7 @@ impl ExecCommandHandler {
                 original_token_count: None,
                 output_omitted_bytes: None,
                 hook_command: None,
+                completion_receipt: None,
             }));
         }
 
@@ -436,12 +463,21 @@ impl ExecCommandHandler {
             justification,
             prefix_rule,
         };
+        let completion_mode = if notify_on_exit {
+            ExecCompletionMode::NotifyOnExit
+        } else {
+            ExecCompletionMode::Default
+        };
         let result = match completion_timeout {
             Some(timeout) => {
                 UnifiedExecProcessManager::exec_command_to_completion(request, &context, timeout)
                     .await
             }
-            None => manager.exec_command(request, &context).await,
+            None => {
+                manager
+                    .exec_command_with_completion_mode(request, &context, completion_mode)
+                    .await
+            }
         };
         match result {
             Ok(response) => Ok(boxed_tool_output(response)),
@@ -468,7 +504,13 @@ impl ExecCommandHandler {
                     original_token_count: Some(original_token_count),
                     output_omitted_bytes,
                     hook_command: Some(hook_command),
+                    completion_receipt: None,
                 }))
+            }
+            Err(UnifiedExecError::ReceiptCapacityExceeded { capacity }) => {
+                Err(FunctionCallError::RespondToModel(format!(
+                    "completion notification capacity is full ({capacity} receipt slots in use); release an unused subscription with exec_notification, or retry without notify_on_exit."
+                )))
             }
             Err(err) => {
                 let message = format!("exec_command failed: {err:?}");

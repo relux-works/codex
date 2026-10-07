@@ -12,6 +12,7 @@ use super::InitialResponseDecision;
 use super::InitialResponseOutcome;
 use super::MAX_COMPLETION_RECEIPTS;
 use super::ReceiptError;
+use super::ReceiptId;
 use super::ReceiptOwner;
 use super::ReceiptStatus;
 use super::SamplingSource;
@@ -193,7 +194,7 @@ fn completion_receipt_exit_and_initial_response_are_linearized_in_both_orders() 
             &early_armed_owner,
             InitialResponseDecision::Arm,
         ),
-        Ok(InitialResponseOutcome::Queued)
+        Ok(InitialResponseOutcome::Queued(completion(Some(27))))
     );
     let lease = early_armed_store
         .lease_for_sampling(
@@ -921,7 +922,7 @@ fn completion_receipt_duplicate_exit_while_reserved_preserves_first_completion()
             &queued_owner,
             InitialResponseDecision::Arm,
         ),
-        Ok(InitialResponseOutcome::Queued)
+        Ok(InitialResponseOutcome::Queued(first_queued_completion))
     );
     let lease = queued_store
         .lease_for_sampling(
@@ -1295,4 +1296,20 @@ fn completion_receipt_poisoned_lock_returns_a_structured_error_after_panic() {
         store.cancel(receipt_id, &owner, CancellationReason::Released),
         Err(ReceiptError::LockPoisoned)
     );
+}
+
+#[test]
+fn model_handle_round_trips_and_rejects_non_uuids() {
+    let store = CompletionReceiptStore::default();
+    let owner = receipt_owner(1);
+    let receipt_id = store.reserve(owner).expect("reservation should succeed");
+    let handle = receipt_id.model_handle();
+    assert_eq!(ReceiptId::from_model_handle(&handle), Some(receipt_id));
+    assert_eq!(
+        ReceiptId::from_model_handle(&format!("  {handle}\n")),
+        Some(receipt_id),
+        "surrounding whitespace should be tolerated"
+    );
+    assert_eq!(ReceiptId::from_model_handle("not-a-receipt"), None);
+    assert_eq!(ReceiptId::from_model_handle(""), None);
 }

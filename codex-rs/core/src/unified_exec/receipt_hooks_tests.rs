@@ -1673,3 +1673,434 @@ async fn default_launches_reserve_no_receipts() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn notification_owner_resolves_launch_owner_across_tool_calls() -> anyhow::Result<()> {
+    let (session, turn, _rx_event) = hook_test_session().await;
+    let manager = &session.services.unified_exec_manager;
+    let launch = test_context(&session, &turn, "launch-call");
+    let owner = manager.receipt_owner_for(&launch)?;
+    let receipt_id = manager
+        .reserve_completion_receipt(owner.clone(), /*process_id*/ 5001)
+        .await?;
+
+    // A later exec_notification call carries a different call id; only the
+    // thread and runtime generation are verified against the caller.
+    let tool_call = test_context(&session, &turn, "exec-notification-call");
+    assert_eq!(
+        manager
+            .notification_owner_for_receipt(receipt_id, &tool_call)
+            .await?,
+        owner
+    );
+
+    // Unknown: an id reserved on a separate store.
+    let separate = CompletionReceiptStore::default();
+    let unknown_id = separate.reserve(owner.clone())?;
+    assert_eq!(
+        manager
+            .notification_owner_for_receipt(unknown_id, &tool_call)
+            .await,
+        Err(ReceiptError::UnknownReceipt)
+    );
+
+    // Foreign: same store, different thread, generation, or (with a
+    // generation mismatch) call.
+    let other_manager = UnifiedExecProcessManager::default();
+    for (index, foreign_owner) in foreign_receipt_owners(
+        session.thread_id,
+        other_manager.receipt_generation,
+        "launch-call",
+    )
+    .into_iter()
+    .enumerate()
+    {
+        let foreign_id = manager
+            .reserve_completion_receipt(foreign_owner, /*process_id*/ -(5100 + index as i32))
+            .await?;
+        assert_eq!(
+            manager
+                .notification_owner_for_receipt(foreign_id, &tool_call)
+                .await,
+            Err(ReceiptError::ForeignOwner)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn enqueue_published_completion_enqueues_live_queued_receipt() -> anyhow::Result<()> {
+    let (session, turn, _rx_event) = hook_test_session().await;
+    let manager = &session.services.unified_exec_manager;
+    let context = test_context(&session, &turn, "launch-call");
+    let owner = manager.receipt_owner_for(&context)?;
+    let receipt_id = manager
+        .reserve_completion_receipt(owner.clone(), /*process_id*/ 5201)
+        .await?;
+    assert_eq!(
+        manager.receipt_store().resolve_initial_response(
+            receipt_id,
+            &owner,
+            InitialResponseDecision::Arm,
+        ),
+        Ok(InitialResponseOutcome::Armed)
+    );
+    let completion = TerminalCompletion {
+        exit_code: Some(3),
+        timed_out: false,
+    };
+    manager
+        .receipt_store()
+        .publish_exit(receipt_id, &owner, completion)?;
+    manager
+        .watcher_receipt_hook(receipt_id, owner.clone())
+        .hooks
+        .lock()
+        .await
+        .retention
+        .insert_pending(
+            receipt_id,
+            owner.clone(),
+            b"kept".to_vec(),
+            /*omitted_bytes*/ 0,
+        );
+
+    // Suppress the idle wake: an active turn makes the wake attempt a no-op,
+    // so this test observes the enqueue decision deterministically.
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    manager
+        .enqueue_published_completion(
+            &session,
+            receipt_id,
+            &owner,
+            completion,
+            /*process_id*/ 5201,
+            Some("boom".to_string()),
+        )
+        .await;
+    *session.active_turn.lock().await = None;
+
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    let leases = session.input_queue.lease_runtime_notifications().await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].receipt_id(), receipt_id);
+    assert_eq!(leases[0].completion().process_id, 5201);
+    assert_eq!(leases[0].completion().exit_code, Some(3));
+    assert_eq!(leases[0].completion().failure.as_deref(), Some("boom"));
+    assert!(
+        manager
+            .read_retained_output(receipt_id, &owner)
+            .await
+            .is_ok(),
+        "enqueue should keep retained output"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn enqueue_published_completion_skips_disarmed_receipt() -> anyhow::Result<()> {
+    let (session, turn, _rx_event) = hook_test_session().await;
+    let manager = &session.services.unified_exec_manager;
+    let context = test_context(&session, &turn, "launch-call");
+    let owner = manager.receipt_owner_for(&context)?;
+    let receipt_id = manager
+        .reserve_completion_receipt(owner.clone(), /*process_id*/ 5301)
+        .await?;
+    manager.receipt_store().resolve_initial_response(
+        receipt_id,
+        &owner,
+        InitialResponseDecision::Arm,
+    )?;
+    manager.receipt_store().publish_exit(
+        receipt_id,
+        &owner,
+        TerminalCompletion {
+            exit_code: Some(0),
+            timed_out: false,
+        },
+    )?;
+    manager
+        .watcher_receipt_hook(receipt_id, owner.clone())
+        .hooks
+        .lock()
+        .await
+        .retention
+        .insert_pending(
+            receipt_id,
+            owner.clone(),
+            b"kept".to_vec(),
+            /*omitted_bytes*/ 0,
+        );
+    manager
+        .release_completion_receipt(receipt_id, &owner)
+        .await?;
+
+    // No active-turn guard needed: a disarmed receipt earns no wake attempt.
+    manager
+        .enqueue_published_completion(
+            &session,
+            receipt_id,
+            &owner,
+            TerminalCompletion {
+                exit_code: Some(0),
+                timed_out: false,
+            },
+            /*process_id*/ 5301,
+            None,
+        )
+        .await;
+
+    assert!(
+        !session.input_queue.has_pending_mailbox_items().await,
+        "disarmed receipt should earn no mailbox entry"
+    );
+    assert_eq!(
+        manager.read_retained_output(receipt_id, &owner).await,
+        Err(ReceiptError::Cancelled {
+            reason: CancellationReason::Released
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn enqueue_published_completion_drops_ghost_retention() -> anyhow::Result<()> {
+    let (session, turn, _rx_event) = hook_test_session().await;
+    let manager = &session.services.unified_exec_manager;
+    let context = test_context(&session, &turn, "launch-call");
+    let owner = manager.receipt_owner_for(&context)?;
+    let receipt_id = manager
+        .reserve_completion_receipt(owner.clone(), /*process_id*/ 5401)
+        .await?;
+    manager.receipt_store().resolve_initial_response(
+        receipt_id,
+        &owner,
+        InitialResponseDecision::Arm,
+    )?;
+    manager.receipt_store().publish_exit(
+        receipt_id,
+        &owner,
+        TerminalCompletion {
+            exit_code: Some(0),
+            timed_out: false,
+        },
+    )?;
+    // Simulate a release racing the watcher insert: the store is cancelled
+    // but retention was inserted afterwards anyway.
+    manager
+        .receipt_store()
+        .cancel(receipt_id, &owner, CancellationReason::Released)?;
+    manager
+        .watcher_receipt_hook(receipt_id, owner.clone())
+        .hooks
+        .lock()
+        .await
+        .retention
+        .insert_pending(
+            receipt_id,
+            owner.clone(),
+            b"ghost".to_vec(),
+            /*omitted_bytes*/ 0,
+        );
+
+    manager
+        .enqueue_published_completion(
+            &session,
+            receipt_id,
+            &owner,
+            TerminalCompletion {
+                exit_code: Some(0),
+                timed_out: false,
+            },
+            /*process_id*/ 5401,
+            None,
+        )
+        .await;
+
+    assert!(
+        !session.input_queue.has_pending_mailbox_items().await,
+        "disarmed receipt should earn no mailbox entry"
+    );
+    assert_eq!(
+        manager
+            .receipt_hooks
+            .lock()
+            .await
+            .retention
+            .lookup(receipt_id, &owner),
+        crate::unified_exec::receipt_output::RetentionLookup::Absent,
+        "ghost retention should be dropped"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn default_launch_acknowledges_no_receipt() -> anyhow::Result<()> {
+    let (session, turn, _rx_event) = hook_test_session().await;
+    let manager = &session.services.unified_exec_manager;
+    let output = exec_command_for_hooks(
+        &session,
+        &turn,
+        "call-default-no-receipt",
+        "sleep 5",
+        /*yield_time_ms*/ 250,
+        ExecCompletionMode::Default,
+    )
+    .await?;
+    let process_id = output.process_id.expect("default launch should yield");
+    assert_eq!(
+        output.completion_receipt, None,
+        "default launch should acknowledge no receipt"
+    );
+    assert!(
+        manager.receipt_for_process(process_id).await.is_none(),
+        "default launch should bind no receipt"
+    );
+    assert_eq!(manager.receipt_capacity_used().await?, 0);
+    assert!(manager.terminate_process(process_id).await);
+    Ok(())
+}
+
+#[tokio::test]
+async fn opted_in_launch_arms_and_release_silences_later_exit() -> anyhow::Result<()> {
+    let (session, turn, rx_event) = hook_test_session().await;
+    let manager = &session.services.unified_exec_manager;
+    let output = exec_command_for_hooks(
+        &session,
+        &turn,
+        "call-opted-in",
+        "sleep 30",
+        /*yield_time_ms*/ 250,
+        ExecCompletionMode::NotifyOnExit,
+    )
+    .await?;
+    let process_id = output.process_id.expect("opted-in launch should yield");
+    let handle = output
+        .completion_receipt
+        .clone()
+        .expect("opted-in yield should acknowledge a receipt");
+    assert_eq!(manager.receipt_capacity_used().await?, 1);
+    let (receipt_id, owner) = manager
+        .receipt_for_process(process_id)
+        .await
+        .expect("opted-in launch should bind a receipt");
+    assert_eq!(receipt_id.model_handle(), handle);
+
+    manager
+        .release_completion_receipt(receipt_id, &owner)
+        .await?;
+    assert_eq!(
+        manager.receipt_capacity_used().await?,
+        0,
+        "release should free the slot"
+    );
+    // The process survives release: termination still finds it alive.
+    assert!(
+        manager.terminate_process(process_id).await,
+        "release should not kill the process"
+    );
+    // The watcher ran to its terminal event; a released receipt publishes
+    // nothing, so no wake or retention follows.
+    await_command_end(&rx_event).await?;
+    assert!(
+        !session.input_queue.has_pending_mailbox_items().await,
+        "later exit after release should produce no wake"
+    );
+    assert_eq!(
+        manager.read_retained_output(receipt_id, &owner).await,
+        Err(ReceiptError::Cancelled {
+            reason: CancellationReason::Released
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn opted_in_exit_enqueues_wake_without_turn() -> anyhow::Result<()> {
+    let (session, turn, rx_event) = hook_test_session().await;
+    // Suppress the idle wake so the enqueued entry stays observable.
+    *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    let output = exec_command_for_hooks(
+        &session,
+        &turn,
+        "call-opted-in-exit",
+        "sleep 1",
+        /*yield_time_ms*/ 250,
+        ExecCompletionMode::NotifyOnExit,
+    )
+    .await?;
+    assert!(
+        output.completion_receipt.is_some(),
+        "opted-in yield should acknowledge a receipt"
+    );
+    await_command_end(&rx_event).await?;
+    assert!(
+        session.input_queue.has_pending_mailbox_items().await,
+        "opted-in exit should enqueue a wake"
+    );
+    let leases = session.input_queue.lease_runtime_notifications().await;
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].completion().exit_code, Some(0));
+    *session.active_turn.lock().await = None;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sixty_fifth_opted_in_launch_refused_before_execution() -> anyhow::Result<()> {
+    let (session, turn, _rx_event) = hook_test_session().await;
+    let manager = &session.services.unified_exec_manager;
+    for index in 0..MAX_COMPLETION_RECEIPTS {
+        let context = test_context(&session, &turn, &format!("call-fill-{index}"));
+        let owner = manager.receipt_owner_for(&context)?;
+        manager
+            .reserve_completion_receipt(owner, -(6000 + index as i32))
+            .await?;
+    }
+    assert_eq!(
+        manager.receipt_capacity_used().await?,
+        MAX_COMPLETION_RECEIPTS
+    );
+
+    let Err(err) = exec_command_for_hooks(
+        &session,
+        &turn,
+        "call-65th",
+        "echo hi",
+        /*yield_time_ms*/ 250,
+        ExecCompletionMode::NotifyOnExit,
+    )
+    .await
+    else {
+        panic!("65th opted-in launch should be refused");
+    };
+    assert!(
+        matches!(
+            err,
+            UnifiedExecError::ReceiptCapacityExceeded { capacity }
+                if capacity == MAX_COMPLETION_RECEIPTS
+        ),
+        "expected receipt capacity refusal, got {err:?}"
+    );
+    assert_eq!(
+        manager.receipt_capacity_used().await?,
+        MAX_COMPLETION_RECEIPTS
+    );
+    assert!(
+        manager.list_processes().await.is_empty(),
+        "refusal should precede process launch"
+    );
+
+    // The process cap is independent: a default launch still runs while
+    // receipt slots are full.
+    let output = exec_command_for_hooks(
+        &session,
+        &turn,
+        "call-default-while-full",
+        "echo hi",
+        /*yield_time_ms*/ 250,
+        ExecCompletionMode::Default,
+    )
+    .await?;
+    assert_eq!(output.completion_receipt, None);
+    Ok(())
+}
