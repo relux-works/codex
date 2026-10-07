@@ -177,9 +177,6 @@ where
             // Activate the background-wait policy only where the host can
             // promise a completion wake. Headless hosts (and threads started
             // before the marker existed) keep automatic continuation ungated.
-            if AsyncNotificationSupport::read_from(input.thread_store).is_available() {
-                runtime.background_wait_state().enable();
-            }
             self.goal_service.register_runtime(&runtime);
         })
     }
