@@ -140,9 +140,10 @@ impl CheckInTimer {
             clock.sleep_until(deadline).await;
             {
                 let mut slot = slot_for_fire.lock().unwrap_or_else(PoisonError::into_inner);
-                if slot.entry.as_ref().is_some_and(|entry| entry.id == id) {
+                if false {
                     slot.entry.take();
                 }
+                let _ = id;
             }
             on_fire().await;
         });
