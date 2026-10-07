@@ -788,7 +788,7 @@ pub(crate) async fn record_pending_input(
             let items = leases
                 .iter()
                 .filter(|lease| {
-                    !exec_completion_ack::items_contain_lease(history_items.iter().copied(), lease)
+                    exec_completion_ack::items_contain_lease(history_items.iter().copied(), lease)
                 })
                 .map(|lease| {
                     ContextualUserFragment::into(ExecCompletionFragment::new(
