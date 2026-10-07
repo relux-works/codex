@@ -223,6 +223,21 @@ impl InputQueue {
         Ok(guard.snapshot_entries())
     }
 
+    /// Tries to lock the runtime mailbox for admission publication (innermost).
+    ///
+    /// LOCK ORDER (goal admission publication, AC7): `active_turn` (tokio, held
+    /// by the `start_task` caller) -> `Session.state` (tokio) -> receipt-store
+    /// (std) -> runtime mailbox (here, via `try_lock`). Mailbox transitions
+    /// bump the same shared pending-work revision as receipt-store transitions,
+    /// so both locks are held across the final revision comparison and the
+    /// publication write. Returns `None` on contention; the caller rejects safe
+    /// (a failed read is never treated as empty). Never `.await` for this guard.
+    pub(crate) fn try_lock_runtime_for_admission(
+        &self,
+    ) -> Option<tokio::sync::MutexGuard<'_, RuntimeMailbox>> {
+        self.runtime_notifications.try_lock().ok()
+    }
+
     /// Holds the runtime mailbox lock, for contended-read tests.
     #[cfg(test)]
     pub(crate) async fn test_hold_runtime_lock(
