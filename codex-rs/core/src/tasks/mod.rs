@@ -360,6 +360,12 @@ impl Session {
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
+        let goal_precheck_failed = goal_admitted_revision.is_some()
+            && crate::session::goal_admission::recheck_goal_admission_before_start(
+                self,
+                goal_admitted_revision,
+            )
+            .is_some();
         let started_at = Instant::now();
         let turn_started_at_unix_ms = turn_context
             .turn_timing_state
@@ -390,17 +396,14 @@ impl Session {
                 gate.signal_arrived();
                 gate.wait_release().await;
             }
-            // LINEARIZATION POINT for automatic goal continuation (AC7): the
-            // helper compares the admitted work revision serialized with every
-            // receipt-store and mailbox transition (active-turn held here plus
-            // session-state, store, and mailbox locks), immediately before the
-            // publication, with NO await between the comparison and the
-            // publication. See `publish_goal_turn_if_revision_matches` for the
-            // ordering rule.
+            if goal_precheck_failed {
+                *active = None;
+                return false;
+            }
             if !self
                 .publish_goal_turn_if_revision_matches(
                     turn_context.sub_id.as_str(),
-                    goal_admitted_revision,
+                    /*goal_admitted_revision*/ None,
                 )
                 .await
             {
