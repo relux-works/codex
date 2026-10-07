@@ -24,6 +24,8 @@ use codex_extension_api::ToolLifecycleContributor;
 use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnErrorInput;
+use codex_extension_api::TurnInputContext;
+use codex_extension_api::TurnInputContributor;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
@@ -41,6 +43,8 @@ use crate::accounting::GoalAccountingState;
 use crate::activity::GoalTurnStartPermit;
 use crate::analytics::GoalAnalytics;
 use crate::api::GoalService;
+use crate::check_in_clock::CheckInClock;
+use crate::check_in_clock::SystemCheckInClock;
 use crate::events::GoalEventEmitter;
 use crate::metrics::GoalMetrics;
 use crate::runtime::ActiveGoalStopReason;
@@ -66,6 +70,7 @@ pub struct GoalExtension<C> {
     thread_manager: Weak<ThreadManager>,
     goal_service: Arc<GoalService>,
     goal_config: Arc<dyn Fn(&C) -> GoalExtensionConfig + Send + Sync>,
+    check_in_clock: Arc<dyn CheckInClock>,
 }
 
 impl<C> std::fmt::Debug for GoalExtension<C> {
@@ -75,7 +80,12 @@ impl<C> std::fmt::Debug for GoalExtension<C> {
 }
 
 impl<C> GoalExtension<C> {
-    pub(crate) fn new_with_host_capabilities(
+    // Eight dependencies (seven extension hosts plus the injectable check-in
+    // clock); a params struct would churn every installer call site for no
+    // behavior gain. Production passes `SystemCheckInClock` via
+    // `install_with_backend`; suites inject a paused clock.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_host_capabilities_and_clock(
         state_dbs: Arc<codex_state::StateRuntime>,
         analytics_events_client: AnalyticsEventsClient,
         event_sink: Arc<dyn ExtensionEventSink>,
@@ -83,6 +93,7 @@ impl<C> GoalExtension<C> {
         thread_manager: Weak<ThreadManager>,
         goal_service: Arc<GoalService>,
         goal_config: impl Fn(&C) -> GoalExtensionConfig + Send + Sync + 'static,
+        check_in_clock: Arc<dyn CheckInClock>,
     ) -> Self {
         Self {
             state_dbs,
@@ -92,6 +103,7 @@ impl<C> GoalExtension<C> {
             thread_manager,
             goal_service,
             goal_config: Arc::new(goal_config),
+            check_in_clock,
         }
     }
 }
@@ -141,6 +153,7 @@ where
                         .root_accounting_state()
                         .unwrap_or_else(|| parent.accounting_state())
                 });
+            let check_in_clock = Arc::clone(&self.check_in_clock);
             let runtime = input.thread_store.get_or_init::<GoalRuntimeHandle>(|| {
                 GoalRuntimeHandle::new(
                     thread_id,
@@ -155,6 +168,7 @@ where
                         tools_available_for_thread,
                         tools_visible_for_thread,
                         root_accounting_state,
+                        check_in_clock,
                     },
                 )
             });
@@ -241,6 +255,7 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
+            runtime.background_wait_state().note_turn_start();
             if !runtime.is_enabled() {
                 return;
             }
@@ -588,6 +603,29 @@ where
     }
 }
 
+impl<C> TurnInputContributor for GoalExtension<C>
+where
+    C: Send + Sync + 'static,
+{
+    fn contribute<'a>(
+        &'a self,
+        input: TurnInputContext<'a>,
+        _extension_metrics: Option<std::sync::Arc<dyn codex_extension_api::ExtensionMetrics>>,
+        _session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Vec<Box<dyn codex_extension_api::ContextualUserFragment + Send>>> {
+        Box::pin(async move {
+            if !input.user_input.is_empty()
+                && let Some(runtime) = goal_runtime_handle(thread_store)
+            {
+                runtime.background_wait_state().note_human_input();
+            }
+            Vec::new()
+        })
+    }
+}
+
 impl<C> ToolContributor for GoalExtension<C>
 where
     C: Send + Sync + 'static,
@@ -654,7 +692,39 @@ pub fn install_with_backend<C>(
 ) where
     C: Send + Sync + 'static,
 {
-    let extension = Arc::new(GoalExtension::new_with_host_capabilities(
+    install_with_backend_and_clock(
+        registry,
+        state_dbs,
+        analytics_events_client,
+        metrics_client,
+        thread_manager,
+        goal_service,
+        goal_config,
+        Arc::new(SystemCheckInClock),
+    );
+}
+
+/// Installs the goal extension with an explicit check-in clock.
+///
+/// Production uses [`SystemCheckInClock`] via [`install_with_backend`].
+/// Suites inject a paused-time clock so scheduled check-ins fire
+/// deterministically under `tokio::time::advance` without real sleeps.
+// Eight parameters (seven installer hosts plus the clock); see
+// `new_with_host_capabilities_and_clock` for why no params struct.
+#[allow(clippy::too_many_arguments)]
+pub fn install_with_backend_and_clock<C>(
+    registry: &mut ExtensionRegistryBuilder<C>,
+    state_dbs: Arc<codex_state::StateRuntime>,
+    analytics_events_client: AnalyticsEventsClient,
+    metrics_client: Option<MetricsClient>,
+    thread_manager: Weak<ThreadManager>,
+    goal_service: Arc<GoalService>,
+    goal_config: impl Fn(&C) -> GoalExtensionConfig + Send + Sync + 'static,
+    check_in_clock: Arc<dyn CheckInClock>,
+) where
+    C: Send + Sync + 'static,
+{
+    let extension = Arc::new(GoalExtension::new_with_host_capabilities_and_clock(
         state_dbs,
         analytics_events_client,
         registry.event_sink(),
@@ -662,12 +732,14 @@ pub fn install_with_backend<C>(
         thread_manager,
         Arc::clone(&goal_service),
         goal_config,
+        check_in_clock,
     ));
     registry.thread_lifecycle_contributor(extension.clone());
     registry.config_contributor(extension.clone());
     registry.turn_lifecycle_contributor(extension.clone());
     registry.token_usage_contributor(extension.clone());
     registry.tool_lifecycle_contributor(extension.clone());
+    registry.turn_input_contributor(extension.clone());
     registry.tool_contributor(extension);
 }
 

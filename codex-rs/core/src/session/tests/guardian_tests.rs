@@ -115,6 +115,7 @@ async fn activate_turn_with_new_review_authority(session: &Arc<Session>) -> Arc<
                 listen_to_cancellation_token: true,
             },
             TurnStartClaim::AnyVacancy,
+            /*goal_admitted_revision*/ None,
         )
         .await;
 
@@ -726,6 +727,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_exec_command_policy_s
                 listen_to_cancellation_token: true,
             },
             TurnStartClaim::AnyVacancy,
+            /*goal_admitted_revision*/ None,
         )
         .await;
 
@@ -791,6 +793,7 @@ async fn network_approval_uses_published_task_authority_within_same_turn(
                 listen_to_cancellation_token: true,
             },
             TurnStartClaim::AnyVacancy,
+            /*goal_admitted_revision*/ None,
         )
         .await;
     // Inject later-step authority directly while live policy changes remain gated.
