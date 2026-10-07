@@ -13,6 +13,7 @@ use crate::tools::handlers::CurrentTimeHandler;
 use crate::tools::handlers::DynamicToolHandler;
 use crate::tools::handlers::ExecCommandHandler;
 use crate::tools::handlers::ExecCommandHandlerOptions;
+use crate::tools::handlers::ExecNotificationHandler;
 use crate::tools::handlers::GetContextRemainingHandler;
 use crate::tools::handlers::ListAvailablePluginsToInstallHandler;
 use crate::tools::handlers::ListMcpResourceTemplatesHandler;
@@ -61,6 +62,7 @@ use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolRouter;
 use crate::tools::tool_namespaces_info::collect_tool_namespaces_info;
 use codex_connectors::apps_config_from_layer_stack;
+use codex_extension_api::AsyncNotificationSupport;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::GoalActivity;
 use codex_features::Feature;
@@ -112,6 +114,7 @@ struct CoreToolPlanContext<'a> {
     turn_context: &'a TurnContext,
     model_info: &'a ModelInfo,
     goal_activity_present: bool,
+    async_notifications: AsyncNotificationSupport,
     environments: &'a TurnEnvironmentSnapshot,
     mcp: &'a codex_mcp::McpBinding,
     tool_suggest_candidates: Option<&'a crate::tools::router::ToolSuggestCandidates>,
@@ -147,6 +150,9 @@ pub(crate) fn build_tool_router(
             .thread_extension_data
             .get::<GoalActivity>()
             .is_some(),
+        async_notifications: AsyncNotificationSupport::read_from(
+            &session.services.thread_extension_data,
+        ),
         environments,
         mcp,
         tool_suggest_candidates,
@@ -293,6 +299,7 @@ pub(crate) fn build_core_tool_registry(
         turn_context,
         model_info,
         goal_activity_present: false,
+        async_notifications: AsyncNotificationSupport::Unavailable,
         environments,
         mcp,
         tool_suggest_candidates,
@@ -1112,10 +1119,17 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, registry: &mut ToolRegistr
             context.environments,
         ),
         include_windows_shell_guidance: should_include_windows_shell_guidance(context.environments),
+        async_notifications: context.async_notifications,
     };
     if features.enabled(Feature::UnifiedExec) {
         registry.add(ExecCommandHandler::new(options));
         registry.add(WriteStdinHandler);
+        // The notification control tool exists only where the host can
+        // promise a wake; incapable hosts neither advertise it nor accept
+        // notify_on_exit.
+        if context.async_notifications.is_available() {
+            registry.add(ExecNotificationHandler);
+        }
     } else {
         // Managed requirements are the only configuration path that can keep
         // unified exec disabled. Preserve command execution without exposing a

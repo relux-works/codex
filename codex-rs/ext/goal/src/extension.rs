@@ -4,6 +4,7 @@ use std::sync::Weak;
 use codex_analytics::AnalyticsEventsClient;
 use codex_core::ThreadManager;
 use codex_core::TurnStartOptions;
+use codex_extension_api::AsyncNotificationSupport;
 use codex_extension_api::ConfigContributor;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
@@ -173,6 +174,12 @@ where
                 )
             });
             runtime.set_enabled(enabled, input.thread_store);
+            // Activate the background-wait policy only where the host can
+            // promise a completion wake. Headless hosts (and threads started
+            // before the marker existed) keep automatic continuation ungated.
+            if AsyncNotificationSupport::read_from(input.thread_store).is_available() {
+                runtime.background_wait_state().enable();
+            }
             self.goal_service.register_runtime(&runtime);
         })
     }

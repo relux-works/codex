@@ -1,3 +1,4 @@
+mod async_notification;
 mod capabilities;
 mod contributors;
 mod goal_activity;
@@ -10,6 +11,7 @@ mod tool_policy;
 mod turn_admission;
 mod user_instructions;
 
+pub use async_notification::AsyncNotificationSupport;
 pub use goal_activity::GoalActivity;
 pub use goal_activity::GoalActivityState;
 pub use goal_background_wait::GoalAdmissionDecision;

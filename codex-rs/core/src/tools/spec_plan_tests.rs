@@ -2,6 +2,7 @@ use crate::session::tests::update_turn_settings_for_test;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use codex_extension_api::AsyncNotificationSupport;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -3408,4 +3409,81 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
     .await;
     bedrock_with_standalone_web_search.assert_visible_contains(&["web_search"]);
     bedrock_with_standalone_web_search.assert_visible_lacks(&["web"]);
+}
+
+fn exec_command_spec_has_notify_on_exit(router: &ToolRouter) -> bool {
+    router
+        .model_visible_specs()
+        .iter()
+        .find(|spec| spec.name() == "exec_command")
+        .and_then(|spec| match spec {
+            ToolSpec::Function(spec) => spec
+                .parameters
+                .properties
+                .as_ref()
+                .map(|properties| properties.contains_key("notify_on_exit")),
+            ToolSpec::Namespace(_)
+            | ToolSpec::ToolSearch { .. }
+            | ToolSpec::WebSearch { .. }
+            | ToolSpec::Freeform(_) => None,
+        })
+        .unwrap_or(false)
+}
+
+async fn visible_tool_names_for_support(
+    support: Option<AsyncNotificationSupport>,
+) -> (Vec<String>, bool) {
+    let (session, turn) = make_session_and_context().await;
+    if let Some(support) = support {
+        session.services.thread_extension_data.insert(support);
+    }
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let router = super::build_tool_router(
+        &session,
+        step_context.turn.as_ref(),
+        &step_context.settings.model_info,
+        &step_context.environments,
+        &step_context.mcp,
+        /*apps_enabled*/ false,
+        &turn.extension_data,
+        /*tool_suggest_candidates*/ None,
+    )
+    .expect("tool router should build");
+    let names = router
+        .model_visible_specs()
+        .iter()
+        .map(|spec| spec.name().to_string())
+        .collect::<Vec<_>>();
+    let has_notify_on_exit = exec_command_spec_has_notify_on_exit(&router);
+    (names, has_notify_on_exit)
+}
+
+#[tokio::test]
+async fn available_host_lists_exec_notification_and_notify_on_exit() {
+    let (names, has_notify_on_exit) =
+        visible_tool_names_for_support(Some(AsyncNotificationSupport::Available)).await;
+    assert!(
+        names.iter().any(|name| name == "exec_notification"),
+        "available host should list exec_notification in {names:?}"
+    );
+    assert!(
+        has_notify_on_exit,
+        "available host exec_command schema should include notify_on_exit"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_host_hides_exec_notification_and_notify_on_exit() {
+    for support in [None, Some(AsyncNotificationSupport::Unavailable)] {
+        let (names, has_notify_on_exit) = visible_tool_names_for_support(support).await;
+        assert!(
+            !names.iter().any(|name| name == "exec_notification"),
+            "unavailable host should not list exec_notification in {names:?} (support: {support:?})"
+        );
+        assert!(
+            !has_notify_on_exit,
+            "unavailable host exec_command schema should omit notify_on_exit (support: {support:?})"
+        );
+    }
 }
