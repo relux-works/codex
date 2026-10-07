@@ -465,16 +465,7 @@ async fn start_if_idle(
     }
     let goal_admitted_revision = goal_admission.admitted_revision;
 
-    // Automatic goal continuation carries no persistent settings delta:
-    // production sends default thread settings (runtime.rs). Any supplied
-    // delta is ignored so a later gate rejection leaves thread settings and
-    // notifications byte-identical (rejection without effects). Start options
-    // are turn-only and still apply to the new turn context.
-    let thread_settings = if goal_admitted_revision.is_some() {
-        ThreadSettingsOverrides::default()
-    } else {
-        thread_settings
-    };
+    let thread_settings = thread_settings;
 
     let settings = match PreparedTurnInputSettings::prepare(session, thread_settings, start).await {
         Ok(settings) => settings,
