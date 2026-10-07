@@ -131,6 +131,26 @@ impl ExtensionData {
         self.entries().remove(&TypeId::of::<T>()).map(downcast_data)
     }
 
+    /// Removes the attached value of type `T` only when `should_remove`
+    /// accepts the current attachment.
+    ///
+    /// The predicate and removal happen while this map is locked, so concurrent
+    /// callers cannot remove a value after checking a stale attachment. Returns
+    /// `true` when a value was removed, `false` when absent or rejected.
+    pub fn remove_if<T>(&self, should_remove: impl FnOnce(Option<&T>) -> bool) -> bool
+    where
+        T: Any + Send + Sync,
+    {
+        let mut entries = self.entries();
+        let existing = entries
+            .get(&TypeId::of::<T>())
+            .map(|value| downcast_data::<T>(Arc::clone(value)));
+        if !should_remove(existing.as_deref()) {
+            return false;
+        }
+        entries.remove(&TypeId::of::<T>()).is_some()
+    }
+
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<TypeId, ErasedData>> {
         self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }

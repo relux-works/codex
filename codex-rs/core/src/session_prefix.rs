@@ -35,6 +35,21 @@ pub(crate) fn format_inter_agent_completion_message(
     Some(InterAgentCompletionMessage::new(task_name, sender, payload).render())
 }
 
+/// Formats a queue-only interrupted notice for a registered goal wait.
+///
+/// Unlike completion messages, this never uses `FINAL_ANSWER` and never
+/// claims success: the child's turn ended without an answer. Callers send it
+/// only when the direct parent holds a goal-owned durable-sleep marker, once
+/// per `Interrupted` transition; ordinary parents stay quiet.
+pub(crate) fn format_inter_agent_interrupted_message(
+    task_name: &AgentPath,
+    sender: &AgentPath,
+) -> String {
+    format!(
+        "Message Type: INTERRUPTED\nTask name: {task_name}\nSender: {sender}\nPayload:\nAgent interrupted. Its turn ended without a final answer; resend work if still needed."
+    )
+}
+
 #[cfg(test)]
 #[path = "session_prefix_tests.rs"]
 mod tests;

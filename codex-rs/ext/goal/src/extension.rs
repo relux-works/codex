@@ -262,6 +262,10 @@ where
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
+            // Admitted turn start ends the idle wait: remove the owned marker
+            // (check-ins reinsert at the next idle if still waiting). Only the
+            // owned id is removed; foreign sleep is preserved.
+            crate::native_wait::remove_goal_wait_sleep(input.thread_store);
             runtime.background_wait_state().note_turn_start();
             if !runtime.is_enabled() {
                 return;

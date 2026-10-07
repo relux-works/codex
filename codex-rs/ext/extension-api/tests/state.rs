@@ -76,6 +76,18 @@ fn conditional_insert_keeps_the_newest_concurrent_value() {
 }
 
 #[test]
+fn conditional_remove_only_removes_when_predicate_accepts() {
+    let data = ExtensionData::new("thread-1");
+
+    assert!(!data.remove_if(|existing: Option<&u64>| existing.is_some()));
+    data.insert(/*value*/ 7_u64);
+    assert!(!data.remove_if(|existing: Option<&u64>| existing.is_none()));
+    assert_eq!(data.get::<u64>().as_deref(), Some(&7));
+    assert!(data.remove_if(|existing: Option<&u64>| existing == Some(&7)));
+    assert_eq!(data.get::<u64>(), None);
+}
+
+#[test]
 fn get_or_init_initializes_once_and_returns_shared_value() {
     const CALLER_COUNT: usize = 8;
 

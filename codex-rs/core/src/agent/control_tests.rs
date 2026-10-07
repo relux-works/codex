@@ -5640,3 +5640,66 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         .await
         .expect("tree shutdown after partial subtree resume should succeed");
 }
+
+#[tokio::test]
+async fn owned_children_inspection_propagates_failed_lookups() {
+    use crate::agent::owned_children::OwnedChildInspection;
+    use crate::agent::owned_children::OwnedChildrenReadError;
+
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _) = harness.start_thread().await;
+    let child_thread_id = harness
+        .spawn_anonymous_child(parent_thread_id, SpawnAgentOptions::default())
+        .await;
+    let unknown_thread_id = ThreadId::new();
+
+    let manager = harness
+        .control
+        .runtime
+        .upgrade()
+        .expect("manager should be available");
+    let inspections = harness
+        .control
+        .runtime
+        .inspect_owned_child_ids(&manager, &[child_thread_id])
+        .await
+        .expect("loaded child should inspect");
+    assert_eq!(inspections.len(), 1);
+    assert_matches!(
+        &inspections[0],
+        OwnedChildInspection::Loaded { thread_id, .. } if *thread_id == child_thread_id
+    );
+
+    let err = harness
+        .control
+        .runtime
+        .inspect_owned_child_ids(&manager, &[child_thread_id, unknown_thread_id])
+        .await
+        .expect_err("unknown child must propagate, not skip");
+    assert_eq!(
+        err,
+        OwnedChildrenReadError::UnknownChild {
+            thread_id: unknown_thread_id,
+        }
+    );
+
+    assert!(
+        harness
+            .manager
+            .remove_thread(&child_thread_id)
+            .await
+            .is_some()
+    );
+    let inspections = harness
+        .control
+        .runtime
+        .inspect_owned_child_ids(&manager, &[child_thread_id])
+        .await
+        .expect("known unloaded child should report unloaded");
+    assert_eq!(
+        inspections,
+        vec![OwnedChildInspection::Unloaded {
+            thread_id: child_thread_id,
+        }]
+    );
+}

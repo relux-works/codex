@@ -9,7 +9,11 @@ use crate::agent::api::AgentTurnOutcome;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::session_prefix::format_inter_agent_completion_message;
+use crate::session_prefix::format_inter_agent_interrupted_message;
+use codex_extension_items::sleep::SleepItem;
+use codex_extension_items::sleep::is_goal_wait_sleep_id;
 use codex_protocol::AgentPath;
+use codex_protocol::ThreadId;
 use codex_protocol::items::SubAgentActivityItem;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -85,12 +89,23 @@ impl LocalAgentControl {
             }
         }
 
-        let Some(message) = format_inter_agent_completion_message(
-            parent_agent_path.clone(),
-            child_agent_path.clone(),
-            &status,
-        ) else {
-            return;
+        // `Interrupted` is non-final (`is_final` unchanged): notify only when
+        // the direct parent holds a registered goal wait, once per transition,
+        // without claiming success. Ordinary parents stay quiet.
+        let message = if matches!(status, AgentStatus::Interrupted) {
+            if !self.parent_holds_goal_wait_marker(parent_thread_id).await {
+                return;
+            }
+            format_inter_agent_interrupted_message(&parent_agent_path, child_agent_path)
+        } else {
+            let Some(message) = format_inter_agent_completion_message(
+                parent_agent_path.clone(),
+                child_agent_path.clone(),
+                &status,
+            ) else {
+                return;
+            };
+            message
         };
         // `communication` owns the message. Keep a second copy only when the
         // recorder will actually need it after parent delivery succeeds.
@@ -127,5 +142,22 @@ impl LocalAgentControl {
                 },
             );
         }
+    }
+
+    /// Reports whether the direct parent holds a goal-owned wait marker.
+    ///
+    /// Missing manager or parent is quiet (`false`): interrupted notices are
+    /// best effort for registered waits only.
+    async fn parent_holds_goal_wait_marker(&self, parent_thread_id: ThreadId) -> bool {
+        let Ok(manager) = self.runtime.upgrade() else {
+            return false;
+        };
+        let Ok(parent) = manager.get_thread(parent_thread_id).await else {
+            return false;
+        };
+        parent
+            .thread_extension_data()
+            .get::<SleepItem>()
+            .is_some_and(|item| is_goal_wait_sleep_id(item.id.as_str()))
     }
 }
