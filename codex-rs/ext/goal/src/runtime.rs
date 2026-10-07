@@ -719,13 +719,11 @@ impl GoalRuntimeHandle {
                     gate.signal_arrived();
                     gate.wait_release().await;
                 }
-                // Insert BEFORE checking pending mail, then recheck via the
-                // existing scheduler; this closes completion-before-registration.
+                thread.recheck_pending_work_for_goal_wait().await;
                 crate::native_wait::try_register_goal_wait_sleep(
                     thread.thread_extension_data(),
                     self.inner.background_wait.generation(),
                 );
-                thread.recheck_pending_work_for_goal_wait().await;
             } else {
                 crate::native_wait::remove_goal_wait_sleep(thread.thread_extension_data());
             }
