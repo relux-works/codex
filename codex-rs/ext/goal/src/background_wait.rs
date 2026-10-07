@@ -340,10 +340,6 @@ impl BackgroundWaitState {
             .unwrap_or(Duration::MAX);
         let deadline = wait_started_at.checked_add(delay).unwrap_or(Duration::MAX);
         if now < deadline {
-            state.pending_deadline = Some(ArmedDeadline {
-                deadline,
-                generation: state.generation,
-            });
             return BackgroundWaitEvaluation::Wait {
                 next_check_in: Some(deadline),
                 emit_warning: false,
