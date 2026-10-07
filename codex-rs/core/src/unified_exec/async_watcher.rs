@@ -229,7 +229,7 @@ pub(crate) fn spawn_exit_watcher(
                     transcript,
                     omitted_bytes,
                 );
-                if queue_wake {
+                if !queue_wake {
                     session_ref
                         .services
                         .unified_exec_manager
