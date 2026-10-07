@@ -144,25 +144,16 @@ impl Session {
             .services
             .thread_extension_data
             .get::<crate::codex_thread::TestGoalPublishGate>();
-        let store = self.services.unified_exec_manager.receipt_store();
-        store
-            .try_with_locked_state(|| {
-                let _mailbox = match self.input_queue.try_lock_runtime_for_admission() {
-                    Some(guard) => guard,
-                    None => return false,
-                };
-                if self.input_queue.pending_work_revision() != expected {
-                    return false;
-                }
-                if let Some(gate) = gate.as_ref() {
-                    gate.signal_compared();
-                    let _ = gate.wait_attempting(std::time::Duration::from_secs(5));
-                    let _ = gate.wait_done(std::time::Duration::from_millis(200));
-                    gate.record_publish_seq();
-                }
-                state.last_started_turn_id = Some(turn_id.to_string());
-                true
-            })
-            .unwrap_or(false)
+        if self.input_queue.pending_work_revision() != expected {
+            return false;
+        }
+        if let Some(gate) = gate.as_ref() {
+            gate.signal_compared();
+            let _ = gate.wait_attempting(std::time::Duration::from_secs(5));
+            let _ = gate.wait_done(std::time::Duration::from_millis(200));
+            gate.record_publish_seq();
+        }
+        state.last_started_turn_id = Some(turn_id.to_string());
+        true
     }
 }
