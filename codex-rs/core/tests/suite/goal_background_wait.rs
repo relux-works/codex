@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use codex_analytics::AnalyticsEventsClient;
+use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_extension_api::AsyncNotificationSupport;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -38,6 +40,7 @@ use codex_goal_extension::install_with_backend_and_clock;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
@@ -121,6 +124,7 @@ async fn fixture(
     server: &wiremock::MockServer,
     clock: Arc<dyn CheckInClock>,
     sink: Arc<RecordingWarningSink>,
+    support: Option<AsyncNotificationSupport>,
 ) -> Result<(TestCodex, Arc<codex_state::StateRuntime>, Arc<GoalService>)> {
     let home = Arc::new(TempDir::new()?);
     let mut config = core_test_support::load_default_config_for_test(&home).await;
@@ -154,6 +158,9 @@ async fn fixture(
     test.codex
         .thread_extension_data()
         .remove::<GoalRuntimeHandle>();
+    if let Some(support) = support {
+        test.codex.thread_extension_data().insert(support);
+    }
     let mut bound = ExtensionRegistryBuilder::<Config>::with_event_sink(sink);
     install(
         &mut bound,
@@ -202,18 +209,30 @@ async fn scheduled_checkins_fire_through_production_runtime_under_paused_time() 
     .await;
     let clock: Arc<dyn CheckInClock> = Arc::new(PausedClock::new(Duration::from_secs(600_000)));
     let sink = Arc::new(RecordingWarningSink::default());
-    let (test, db, service) = fixture(&server, Arc::clone(&clock), Arc::clone(&sink)).await?;
+    let (test, db, service) = fixture(
+        &server,
+        Arc::clone(&clock),
+        Arc::clone(&sink),
+        Some(AsyncNotificationSupport::Available),
+    )
+    .await?;
     let thread_id = test.session_configured.thread_id;
 
     // Enable the policy and arm the stalled receipt BEFORE creating the goal:
     // `apply_runtime_effects` runs an initial `continue_if_idle`, which must
     // see the Armed work and wait (arming the first timer) instead of starting
-    // an immediate turn that would leave the thread non-idle.
+    // an immediate turn that would leave the thread non-idle. Thread start on
+    // a capable host activates the policy; the explicit enable below keeps the
+    // pre-activation setup assumption intact.
     let runtime = test
         .codex
         .thread_extension_data()
         .get::<GoalRuntimeHandle>()
         .expect("goal runtime should exist");
+    assert!(
+        runtime.background_wait_state().is_enabled(),
+        "capable host should activate the policy at thread start"
+    );
     runtime.background_wait_state().enable();
     assert!(
         test.codex.test_arm_exec_receipt_for_background_wait().await,
@@ -297,5 +316,154 @@ async fn scheduled_checkins_fire_through_production_runtime_under_paused_time() 
     assert_eq!(runtime.test_marked_goal_continuations().len(), 3);
     assert_eq!(sink.warnings().len(), 1);
     assert_eq!(mock.requests().len(), 3);
+    Ok(())
+}
+
+/// Policy activation on a capable host: pending opted-in work gates automatic
+/// goal continuation, while explicit user input is still admitted.
+/// Production entry points: `GoalExtension::on_thread_start` (activation) ->
+/// `GoalRuntimeHandle::continue_if_idle` (Wait arm) gates
+/// `CodexThread::emit_thread_idle_lifecycle_if_idle`, and
+/// `CodexThread::start_or_steer_turn` admits the user turn.
+#[tokio::test(flavor = "current_thread")]
+async fn background_wait_activation_gates_goal_but_admits_user_input() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let mock =
+        responses::mount_sse_sequence(&server, vec![responses::sse_completed("should-stay-quiet")])
+            .await;
+    let clock: Arc<dyn CheckInClock> = Arc::new(PausedClock::new(Duration::from_secs(600_000)));
+    let sink = Arc::new(RecordingWarningSink::default());
+    let (test, db, service) = fixture(
+        &server,
+        Arc::clone(&clock),
+        Arc::clone(&sink),
+        Some(AsyncNotificationSupport::Available),
+    )
+    .await?;
+    let thread_id = test.session_configured.thread_id;
+
+    let runtime = test
+        .codex
+        .thread_extension_data()
+        .get::<GoalRuntimeHandle>()
+        .expect("goal runtime should exist");
+    assert!(
+        runtime.background_wait_state().is_enabled(),
+        "capable host should activate the policy without manual enable"
+    );
+    assert!(
+        test.codex.test_arm_exec_receipt_for_background_wait().await,
+        "stalled Armed receipt should arm",
+    );
+
+    let outcome = service
+        .set_thread_goal(
+            &db,
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Set("activation gated work"),
+                status: None,
+                token_budget: GoalTokenBudgetUpdate::Keep,
+                max_goal_token_budget: None,
+            },
+        )
+        .await
+        .expect("goal creation should succeed");
+    outcome.apply_runtime_effects(&service).await;
+
+    test.codex
+        .emit_thread_idle_lifecycle_if_idle(codex_extension_api::ThreadIdleCause::Completed)
+        .await;
+    assert_eq!(
+        mock.requests().len(),
+        0,
+        "pending opted-in work should gate automatic continuation"
+    );
+    assert!(runtime.test_marked_goal_continuations().is_empty());
+
+    // Explicit user input is still admitted while the gate holds.
+    let user_mock =
+        responses::mount_sse_sequence(&server, vec![responses::sse_completed("user-turn")]).await;
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "continue please".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        user_mock.requests().len(),
+        1,
+        "user input should be admitted while gated"
+    );
+    Ok(())
+}
+
+/// Without the host capability the policy stays inactive and automatic goal
+/// continuation proceeds ungated.
+#[tokio::test(flavor = "current_thread")]
+async fn background_wait_inactive_on_unavailable_host_auto_continues() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let mock = responses::mount_sse_sequence(
+        &server,
+        vec![responses::sse_completed("ungated-continuation")],
+    )
+    .await;
+    let clock: Arc<dyn CheckInClock> = Arc::new(PausedClock::new(Duration::from_secs(600_000)));
+    let sink = Arc::new(RecordingWarningSink::default());
+    let (test, db, service) = fixture(
+        &server,
+        Arc::clone(&clock),
+        Arc::clone(&sink),
+        Some(AsyncNotificationSupport::Unavailable),
+    )
+    .await?;
+    let thread_id = test.session_configured.thread_id;
+
+    let runtime = test
+        .codex
+        .thread_extension_data()
+        .get::<GoalRuntimeHandle>()
+        .expect("goal runtime should exist");
+    assert!(
+        !runtime.background_wait_state().is_enabled(),
+        "headless host should leave the policy inactive"
+    );
+    assert!(
+        test.codex.test_arm_exec_receipt_for_background_wait().await,
+        "stalled Armed receipt should arm",
+    );
+
+    let outcome = service
+        .set_thread_goal(
+            &db,
+            GoalSetRequest {
+                thread_id,
+                objective: GoalObjectiveUpdate::Set("ungated work"),
+                status: None,
+                token_budget: GoalTokenBudgetUpdate::Keep,
+                max_goal_token_budget: None,
+            },
+        )
+        .await
+        .expect("goal creation should succeed");
+    outcome.apply_runtime_effects(&service).await;
+
+    test.codex
+        .emit_thread_idle_lifecycle_if_idle(codex_extension_api::ThreadIdleCause::Completed)
+        .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(
+        mock.requests().len(),
+        1,
+        "without the policy the goal should auto-continue"
+    );
+    assert_eq!(runtime.test_marked_goal_continuations().len(), 1);
     Ok(())
 }

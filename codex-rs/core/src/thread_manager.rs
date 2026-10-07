@@ -2036,6 +2036,32 @@ impl ThreadManagerState {
             .unwrap_or_default()
     }
 
+    /// Resolves async-notification support for a thread whose init seeds none.
+    ///
+    /// Children inherit their parent's stored value explicitly, so a child of
+    /// a headless parent stays `Unavailable` even though the child's own
+    /// session source is never `Exec`. A child whose parent is unknown or
+    /// unloaded fails closed to `Unavailable`. Parentless roots (including
+    /// resumes) take the host decision for this manager's session source.
+    async fn inherited_async_notification_support(
+        &self,
+        parent_thread_id: Option<ThreadId>,
+    ) -> codex_extension_api::AsyncNotificationSupport {
+        let Some(parent_thread_id) = parent_thread_id else {
+            return codex_extension_api::AsyncNotificationSupport::for_host_session_source(
+                &self.session_source,
+            );
+        };
+        self.get_thread(parent_thread_id)
+            .await
+            .map(|parent| {
+                codex_extension_api::AsyncNotificationSupport::read_from(
+                    &parent.session.services.thread_extension_data,
+                )
+            })
+            .unwrap_or(codex_extension_api::AsyncNotificationSupport::Unavailable)
+    }
+
     /// Spawn a new thread with optional history and register it with the manager.
     async fn spawn_thread(&self, request: ThreadSpawnRequest) -> CodexResult<NewThread> {
         let ThreadSpawnRequest {
@@ -2169,6 +2195,17 @@ impl ThreadManagerState {
                 }) => Some(*parent_thread_id),
                 _ => None,
             });
+        if thread_extension_init
+            .get::<codex_extension_api::AsyncNotificationSupport>()
+            .is_none()
+        {
+            thread_extension_init.insert(
+                self.inherited_async_notification_support(
+                    parent_thread_id.or(forked_from_thread_id),
+                )
+                .await,
+            );
+        }
         // Host controllers can already be shared with live threads. Publish root settings
         // only after registration succeeds, so a failed start cannot update their tree.
         let initial_host_config = (self.agent_control_factory.is_some()

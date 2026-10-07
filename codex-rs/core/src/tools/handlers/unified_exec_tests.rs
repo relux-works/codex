@@ -443,6 +443,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         original_token_count: None,
         output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
+        completion_receipt: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
     let handler = ExecCommandHandler::default();
@@ -474,6 +475,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         original_token_count: None,
         output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
+        completion_receipt: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
     let handler = ExecCommandHandler::default();
@@ -506,6 +508,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         original_token_count: None,
         output_omitted_bytes: None,
         hook_command: Some("echo three".to_string()),
+        completion_receipt: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
     let handler = ExecCommandHandler::default();
@@ -533,6 +536,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         original_token_count: None,
         output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
+        completion_receipt: None,
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
     let handler = WriteStdinHandler;
@@ -565,6 +569,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         output_omitted_bytes: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
+        completion_receipt: None,
     };
     let output_b = ExecCommandToolOutput {
         event_call_id: "exec-call-b".to_string(),
@@ -578,6 +583,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         original_token_count: None,
         output_omitted_bytes: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
+        completion_receipt: None,
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;
@@ -690,4 +696,135 @@ async fn write_stdin_rejects_fractional_and_wrong_typed_integer_fields() {
             "expected parse envelope for {field}={value}, got {message}"
         );
     }
+}
+
+async fn invocation_with_session_for_payload(
+    tool_name: &str,
+    call_id: &str,
+    payload: ToolPayload,
+) -> (ToolInvocation, Arc<crate::session::session::Session>) {
+    let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let session = Arc::new(session);
+    let invocation = ToolInvocation {
+        session: Arc::clone(&session),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: call_id.to_string(),
+        tool_name: codex_tools::ToolName::plain(tool_name),
+        source: ToolCallSource::Direct,
+        payload,
+    };
+    (invocation, session)
+}
+
+fn exec_handler_options(
+    async_notifications: codex_extension_api::AsyncNotificationSupport,
+) -> ExecCommandHandlerOptions {
+    ExecCommandHandlerOptions {
+        allow_login_shell: false,
+        allow_tty: true,
+        exec_permission_approvals_enabled: false,
+        include_environment_id: false,
+        include_shell_parameter: true,
+        include_windows_shell_guidance: false,
+        async_notifications,
+    }
+}
+
+#[test]
+fn exec_command_args_default_notify_on_exit_to_false() -> anyhow::Result<()> {
+    let default_args: ExecCommandArgs = parse_arguments(r#"{"cmd": "echo hi"}"#)?;
+    assert!(!default_args.notify_on_exit);
+
+    let opted_in: ExecCommandArgs =
+        parse_arguments(r#"{"cmd": "echo hi", "notify_on_exit": true}"#)?;
+    assert!(opted_in.notify_on_exit);
+    Ok(())
+}
+
+#[test]
+fn default_exec_command_spec_omits_notify_on_exit() {
+    let spec = ExecCommandHandler::default().spec();
+    let serialized = serde_json::to_value(&spec).expect("spec should serialize");
+    assert!(
+        serialized
+            .pointer("/parameters/properties/notify_on_exit")
+            .is_none(),
+        "default (unavailable) handler spec should omit notify_on_exit"
+    );
+}
+
+#[tokio::test]
+async fn notify_on_exit_refused_before_execution_on_unavailable_host() {
+    let arguments = serde_json::json!({ "cmd": "echo hi", "notify_on_exit": true }).to_string();
+    let (invocation, session) = invocation_with_session_for_payload(
+        "exec_command",
+        "notify-unavailable",
+        ToolPayload::Function { arguments },
+    )
+    .await;
+    // No capability marker seeded: the host cannot promise a wake.
+
+    let Err(error) = ExecCommandHandler::default().handle(invocation).await else {
+        panic!("notify_on_exit on an unavailable host should be refused");
+    };
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected a model-facing refusal, got {error:?}");
+    };
+    assert!(
+        message.contains("notify_on_exit is not supported on this host"),
+        "unexpected refusal: {message}"
+    );
+    assert_eq!(
+        session
+            .services
+            .unified_exec_manager
+            .receipt_capacity_used()
+            .await
+            .expect("capacity should read"),
+        0,
+        "refusal must precede receipt reservation"
+    );
+}
+
+#[tokio::test]
+async fn notify_on_exit_refused_for_one_shot_handler() {
+    let arguments = serde_json::json!({ "cmd": "echo hi", "notify_on_exit": true }).to_string();
+    let (invocation, session) = invocation_with_session_for_payload(
+        "exec_command",
+        "notify-oneshot",
+        ToolPayload::Function { arguments },
+    )
+    .await;
+    session
+        .services
+        .thread_extension_data
+        .insert(codex_extension_api::AsyncNotificationSupport::Available);
+    let handler = ExecCommandHandler::one_shot(exec_handler_options(
+        codex_extension_api::AsyncNotificationSupport::Available,
+    ));
+
+    let Err(error) = handler.handle(invocation).await else {
+        panic!("notify_on_exit on a one-shot handler should be refused");
+    };
+    let FunctionCallError::RespondToModel(message) = error else {
+        panic!("expected a model-facing refusal, got {error:?}");
+    };
+    assert!(
+        message.contains("not supported for one-shot execution"),
+        "unexpected refusal: {message}"
+    );
+    assert_eq!(
+        session
+            .services
+            .unified_exec_manager
+            .receipt_capacity_used()
+            .await
+            .expect("capacity should read"),
+        0,
+        "refusal must precede receipt reservation"
+    );
 }

@@ -14,6 +14,7 @@ use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
+use codex_extension_api::AsyncNotificationSupport;
 use codex_extension_api::empty_extension_registry;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
@@ -3309,5 +3310,169 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
             })
             .count(),
         1,
+    );
+}
+
+fn stored_async_notification_support(thread: &NewThread) -> Option<AsyncNotificationSupport> {
+    thread
+        .thread
+        .thread_extension_data()
+        .get::<AsyncNotificationSupport>()
+        .map(|support| *support)
+}
+
+fn manager_with_host_source(config: &Config, session_source: SessionSource) -> ThreadManager {
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    ThreadManager::new(
+        config,
+        Arc::clone(&auth_manager),
+        build_models_manager(config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        session_source,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        passthrough_image_store(),
+        thread_store_from_config(config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    )
+}
+
+#[tokio::test]
+async fn async_notification_roots_follow_host_session_source() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    for (source, expected) in [
+        (SessionSource::Cli, AsyncNotificationSupport::Available),
+        (SessionSource::VSCode, AsyncNotificationSupport::Available),
+        (SessionSource::Exec, AsyncNotificationSupport::Unavailable),
+        // Non-exec but unverified hosts stay unavailable: "not Exec" alone
+        // never enables notifications.
+        (SessionSource::Mcp, AsyncNotificationSupport::Unavailable),
+        (
+            SessionSource::Custom("other".to_string()),
+            AsyncNotificationSupport::Unavailable,
+        ),
+        (
+            SessionSource::Unknown,
+            AsyncNotificationSupport::Unavailable,
+        ),
+    ] {
+        let manager = manager_with_host_source(&config, source.clone());
+        let thread = manager
+            .start_thread(StartThreadOptions::new(config.clone()))
+            .await
+            .expect("root thread should start");
+        assert_eq!(
+            stored_async_notification_support(&thread),
+            Some(expected),
+            "host source {source:?} should seed {expected:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn async_notification_explicit_init_overrides_host_source() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = manager_with_host_source(&config, SessionSource::Exec);
+    let mut options = StartThreadOptions::new(config.clone());
+    options
+        .thread_extension_init
+        .insert(AsyncNotificationSupport::Available);
+    let thread = manager
+        .start_thread(options)
+        .await
+        .expect("root thread should start");
+    assert_eq!(
+        stored_async_notification_support(&thread),
+        Some(AsyncNotificationSupport::Available),
+        "explicit host seeding should win over the manager source"
+    );
+}
+
+#[tokio::test]
+async fn async_notification_child_of_headless_parent_stays_unavailable() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = manager_with_host_source(&config, SessionSource::Exec);
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("parent thread should start");
+    assert_eq!(
+        stored_async_notification_support(&parent),
+        Some(AsyncNotificationSupport::Unavailable)
+    );
+    // The child's own session source is Internal, never Exec: deriving from
+    // "not Exec" would wrongly enable it.
+    let child = manager
+        .spawn_internal_session(
+            parent.thread_id,
+            StartThreadOptions {
+                session_source: Some(SessionSource::Internal(
+                    InternalSessionSource::MemoryConsolidation,
+                )),
+                ..StartThreadOptions::new(config.clone())
+            },
+        )
+        .await
+        .expect("child thread should start");
+    assert_eq!(
+        stored_async_notification_support(&child),
+        Some(AsyncNotificationSupport::Unavailable),
+        "a child of a headless parent should stay unavailable"
+    );
+}
+
+#[tokio::test]
+async fn async_notification_child_of_available_parent_inherits_available() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = manager_with_host_source(&config, SessionSource::VSCode);
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("parent thread should start");
+    assert_eq!(
+        stored_async_notification_support(&parent),
+        Some(AsyncNotificationSupport::Available)
+    );
+    let child = manager
+        .spawn_internal_session(
+            parent.thread_id,
+            StartThreadOptions {
+                session_source: Some(SessionSource::Internal(
+                    InternalSessionSource::MemoryConsolidation,
+                )),
+                ..StartThreadOptions::new(config.clone())
+            },
+        )
+        .await
+        .expect("child thread should start");
+    assert_eq!(
+        stored_async_notification_support(&child),
+        Some(AsyncNotificationSupport::Available),
+        "a child of an available parent should inherit availability"
     );
 }
