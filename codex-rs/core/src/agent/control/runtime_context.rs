@@ -189,20 +189,15 @@ impl LocalAgentRuntime {
                     });
                 }
                 Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
-                    self.ensure_agent_known(child_thread_id).map_err(|_| {
-                        OwnedChildrenReadError::UnknownChild {
-                            thread_id: child_thread_id,
-                        }
-                    })?;
+                    if self.ensure_agent_known(child_thread_id).is_err() {
+                        continue;
+                    }
                     inspections.push(OwnedChildInspection::Unloaded {
                         thread_id: child_thread_id,
                     });
                 }
-                Err(err) => {
-                    return Err(OwnedChildrenReadError::InspectionFailed {
-                        thread_id: child_thread_id,
-                        reason: err.to_string(),
-                    });
+                Err(_) => {
+                    continue;
                 }
             }
         }
