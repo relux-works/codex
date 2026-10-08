@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use codex_core::OwnedChildInspection;
 use codex_core::StartIfIdleSubmission;
 use codex_core::ThreadManager;
 use codex_core::TurnInput;
@@ -142,6 +143,7 @@ impl GoalRuntimeHandle {
         self.inner.activity.set_enabled(enabled, store);
         if !enabled {
             self.inner.accounting_state.clear_active_goal();
+            crate::native_wait::remove_goal_wait_sleep(store);
             store.remove::<TurnStartOptions>();
             store.remove::<GoalTurnStartPermit>();
         }
@@ -152,8 +154,30 @@ impl GoalRuntimeHandle {
         self.inner.activity.stop(store);
         self.inner.accounting_state.clear_active_goal();
         self.inner.background_wait.note_stop();
+        crate::native_wait::remove_goal_wait_sleep(store);
         store.remove::<TurnStartOptions>();
         store.remove::<GoalTurnStartPermit>();
+    }
+
+    /// Removes the goal-owned native-wait marker from the live thread, if present.
+    ///
+    /// Only the owned `goal-wait:*` id is removed; foreign sleep markers are
+    /// preserved. Missing manager or thread is a no-op (nothing to clean).
+    pub(crate) async fn remove_native_wait_marker(&self) {
+        let Some(manager) = self.inner.thread_manager.upgrade() else {
+            return;
+        };
+        let Ok(thread) = manager.get_thread(self.inner.thread_id).await else {
+            return;
+        };
+        crate::native_wait::remove_goal_wait_sleep(thread.thread_extension_data());
+    }
+
+    /// Releases an explicitly released wait: resets the check-in epoch and
+    /// removes the owned marker without killing any child work.
+    pub async fn release_native_wait(&self) {
+        self.inner.background_wait.note_release();
+        self.remove_native_wait_marker().await;
     }
 
     /// Goal-owned background waiting policy for this thread.
@@ -396,12 +420,16 @@ impl GoalRuntimeHandle {
                 if self.inner.accounting_state.current_turn_id().is_none() {
                     self.inner.accounting_state.clear_active_goal();
                 }
+                drop(permit);
+                self.remove_native_wait_marker().await;
             }
             codex_state::ThreadGoalStatus::Paused
             | codex_state::ThreadGoalStatus::Blocked
             | codex_state::ThreadGoalStatus::UsageLimited
             | codex_state::ThreadGoalStatus::Complete => {
                 self.inner.accounting_state.clear_active_goal();
+                drop(permit);
+                self.remove_native_wait_marker().await;
             }
         }
         Ok(())
@@ -418,6 +446,8 @@ impl GoalRuntimeHandle {
         if committed.is_none() {
             self.inner.accounting_state.clear_active_goal();
         }
+        drop(permit);
+        self.remove_native_wait_marker().await;
         Ok(())
     }
 
@@ -551,6 +581,8 @@ impl GoalRuntimeHandle {
             Some(turn_id.to_string()),
             goal,
         );
+        drop(goal_state_permit);
+        self.remove_native_wait_marker().await;
         Ok(())
     }
 
@@ -558,6 +590,11 @@ impl GoalRuntimeHandle {
         let permit = self.goal_state_permit().await?;
         let goal = self.reconcile_live_activity(&permit).await?;
         self.inner.background_wait.note_resume();
+        // Live-generation-only lease: resume never revives a marker from a
+        // rendered old SleepItem or for a now-unloaded child. A fresh wait, if
+        // still needed, registers at the next idle via `continue_if_idle`.
+        drop(permit);
+        self.remove_native_wait_marker().await;
         if !self.is_enabled() {
             return Ok(());
         }
@@ -616,6 +653,7 @@ impl GoalRuntimeHandle {
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
         if !self.tools_available() {
             self.inner.accounting_state.clear_active_goal();
+            self.remove_native_wait_marker().await;
             return Ok(());
         }
         // Hold this through the read/start window so external set/clear cannot
@@ -645,21 +683,84 @@ impl GoalRuntimeHandle {
 
         let Some(goal) = goal else {
             self.inner.accounting_state.clear_active_goal();
+            crate::native_wait::remove_goal_wait_sleep(thread.thread_extension_data());
             return Ok(());
         };
         if goal.status != codex_state::ThreadGoalStatus::Active {
             self.inner.accounting_state.clear_active_goal();
+            crate::native_wait::remove_goal_wait_sleep(thread.thread_extension_data());
             return Ok(());
         }
-        if self.inner.background_wait.is_enabled() {
+        // Native subagent wait: only on a persistent host (background-wait
+        // enabled). Non-goal, unloaded, and unknown work gets no marker;
+        // failed inspection propagates instead of looking empty.
+        let wait_enabled = self.inner.background_wait.is_enabled();
+        let native_pending = if wait_enabled {
+            let inspections = thread
+                .inspect_directly_owned_native_children()
+                .await
+                .map_err(|err| {
+                    format!(
+                        "goal native-wait inspection failed for {}: {err}",
+                        self.thread_id()
+                    )
+                })?;
+            let pending = inspections
+                .iter()
+                .any(OwnedChildInspection::is_pending_native_work);
+            if pending {
+                // Test-only latch: pause between observing Running work and
+                // inserting the marker so the suite can complete the child in
+                // the window. Production inserts no gate.
+                if let Some(gate) = thread
+                    .thread_extension_data()
+                    .get::<crate::native_wait::TestNativeWaitRegistrationGate>()
+                {
+                    gate.signal_arrived();
+                    gate.wait_release().await;
+                }
+                // Insert BEFORE checking pending mail, then recheck via the
+                // existing scheduler; this closes completion-before-registration.
+                crate::native_wait::try_register_goal_wait_sleep(
+                    thread.thread_extension_data(),
+                    self.inner.background_wait.generation(),
+                );
+                // The recheck can synchronously start a wake turn, whose
+                // `on_turn_start` needs this same goal-state permit: share
+                // ownership with that callback rather than letting it
+                // reacquire the semaphore this task holds (self-deadlock).
+                // The lease removes the entry when the block ends without a
+                // turn consuming it, so no stale permit outlives this
+                // critical section; the goal-continuation insert below
+                // installs a fresh entry for its own start attempt.
+                {
+                    thread
+                        .thread_extension_data()
+                        .insert(GoalTurnStartPermit(Arc::clone(&goal_state_permit)));
+                    let _recheck_start_lease = GoalTurnStartLease(thread.thread_extension_data());
+                    thread.recheck_pending_work_for_goal_wait().await;
+                }
+            } else {
+                crate::native_wait::remove_goal_wait_sleep(thread.thread_extension_data());
+            }
+            pending
+        } else {
+            crate::native_wait::remove_goal_wait_sleep(thread.thread_extension_data());
+            false
+        };
+        if wait_enabled {
             let snapshot = codex_extension_api::read_pending_work(thread.thread_extension_data());
             let now = self.inner.check_in_timer.clock().now();
-            match self.inner.background_wait.evaluate_continuation(
-                goal.goal_id.as_str(),
-                GoalWaitStatus::Active,
-                snapshot,
-                now,
-            ) {
+            match self
+                .inner
+                .background_wait
+                .evaluate_continuation_with_native_pending(
+                    goal.goal_id.as_str(),
+                    GoalWaitStatus::Active,
+                    snapshot,
+                    native_pending,
+                    now,
+                ) {
                 BackgroundWaitEvaluation::ProceedWithoutGate
                 | BackgroundWaitEvaluation::ProceedNormal { .. }
                 | BackgroundWaitEvaluation::ProceedWithTicket { .. } => {
