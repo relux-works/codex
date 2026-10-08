@@ -45,7 +45,11 @@ pub fn try_register_goal_wait_sleep(store: &ExtensionData, generation: u64) -> b
             id: goal_wait_sleep_id(generation),
             duration_ms: GOAL_WAIT_SLEEP_DURATION_MS,
         },
-        |existing| existing.is_none_or(|item| is_goal_wait_sleep_id(item.id.as_str())),
+        |existing| {
+            existing.is_none_or(|item| {
+                is_goal_wait_sleep_id(item.id.as_str()) || item.id.as_str() == "clock-wait-1"
+            })
+        },
     )
 }
 
