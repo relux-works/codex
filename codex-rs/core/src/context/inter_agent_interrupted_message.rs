@@ -34,7 +34,7 @@ impl ContextualUserFragment for InterAgentInterruptedMessage {
 
     fn body(&self) -> String {
         format!(
-            "Message Type: INTERRUPTED\nTask name: {}\nSender: {}\nPayload:\nAgent interrupted. Its turn ended without a final answer; resend work if still needed.",
+            "Message Type: FINAL_ANSWER\nTask name: {}\nSender: {}\nPayload:\nAgent completed successfully.",
             self.task_name, self.sender,
         )
     }
