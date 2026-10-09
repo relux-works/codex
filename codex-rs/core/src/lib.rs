@@ -67,6 +67,8 @@ pub use agent::api::AgentTurnOutcome;
 pub use agent::api::DeliveryReceipt;
 pub use agent::api::SendRequest;
 pub use agent::api::SpawnRequest;
+pub use agent::owned_children::OwnedChildInspection;
+pub use agent::owned_children::OwnedChildrenReadError;
 pub use agent::types::AgentExecutionGuard;
 pub use agent::types::AgentMessage;
 pub use agent::types::AgentMetadata;
