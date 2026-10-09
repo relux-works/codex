@@ -117,6 +117,8 @@ impl LocalAgentControl {
             message,
             /*trigger_turn*/ false,
         );
+        // Mutant: deliver the interrupted notice twice per transition.
+        let duplicate = matches!(status, AgentStatus::Interrupted).then(|| communication.clone());
         let context =
             AgentCommunicationContext::new(AgentCommunicationKind::Result, outcome.thread_id);
         if let Err(err) = self
@@ -130,6 +132,18 @@ impl LocalAgentControl {
         {
             debug!("failed to notify parent thread {parent_thread_id}: {err}");
             return;
+        }
+        if let Some(duplicate) = duplicate {
+            let context =
+                AgentCommunicationContext::new(AgentCommunicationKind::Result, outcome.thread_id);
+            let _ = self
+                .send_inter_agent_communication(
+                    parent_thread_id,
+                    duplicate,
+                    context,
+                    TurnStartOptions::default(),
+                )
+                .await;
         }
         if let Some(message) = trace_message {
             trace.record_agent_result_interaction(
