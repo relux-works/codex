@@ -87,6 +87,7 @@ mod git_enrichment;
 #[path = "goal_activity_tests.rs"]
 mod goal_activity;
 mod goal_background_wait;
+mod goal_native_wait;
 mod guardian_authorization;
 mod guardian_authorization_refresh;
 #[path = "guardian_cached_score_tests.rs"]

@@ -2441,7 +2441,11 @@ impl Session {
                 status
             }
         };
-        if !is_final(&status) {
+        // `Interrupted` is non-final by design (`is_final` unchanged): it still
+        // reaches `turn_finished` so a registered goal wait can emit one
+        // queue-only notice per transition. Ordinary parents stay quiet there.
+        let is_interrupted = matches!(status, AgentStatus::Interrupted);
+        if !is_final(&status) && !is_interrupted {
             return;
         }
 

@@ -5,6 +5,7 @@ use codex_utils_output_truncation::truncate_text;
 
 use crate::context::ContextualUserFragment;
 use crate::context::InterAgentCompletionMessage;
+use crate::context::InterAgentInterruptedMessage;
 
 const COMPLETION_MESSAGE_MAX_TOKENS: usize = 1_000;
 const COMPLETION_MESSAGE_ENVELOPE_TOKEN_RESERVE: usize = 100;
@@ -33,6 +34,19 @@ pub(crate) fn format_inter_agent_completion_message(
         AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted => return None,
     };
     Some(InterAgentCompletionMessage::new(task_name, sender, payload).render())
+}
+
+/// Formats a queue-only interrupted notice for a registered goal wait.
+///
+/// Unlike completion messages, this never uses `FINAL_ANSWER` and never
+/// claims success: the child's turn ended without an answer. Callers send it
+/// only when the direct parent holds a goal-owned durable-sleep marker, once
+/// per `Interrupted` transition; ordinary parents stay quiet.
+pub(crate) fn format_inter_agent_interrupted_message(
+    task_name: &AgentPath,
+    sender: &AgentPath,
+) -> String {
+    InterAgentInterruptedMessage::new(task_name.clone(), sender.clone()).render()
 }
 
 #[cfg(test)]

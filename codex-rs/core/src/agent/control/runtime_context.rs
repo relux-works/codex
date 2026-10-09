@@ -2,11 +2,14 @@
 //! These use the same local registry and thread manager as lifecycle operations.
 
 use super::LocalAgentRuntime;
+use crate::agent::owned_children::OwnedChildInspection;
+use crate::agent::owned_children::OwnedChildrenReadError;
 use crate::agent::types::AgentMetadata;
 use crate::session_prefix::format_subagent_context_line;
 use crate::thread_manager::ThreadManagerState;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,5 +136,76 @@ impl LocalAgentRuntime {
         self.manager
             .upgrade()
             .ok_or_else(|| CodexErr::UnsupportedOperation("thread manager dropped".to_string()))
+    }
+
+    /// Inspects directly owned native children without restoring runtimes.
+    ///
+    /// Lists live `ThreadSpawn` edges owned by `parent_thread_id`, then
+    /// inspects each child: loaded runtimes report their current status,
+    /// known-but-unloaded children report [`OwnedChildInspection::Unloaded`],
+    /// and unknown identities or backend failures return
+    /// [`OwnedChildrenReadError`]. Errors propagate; failed lookups are never
+    /// silently skipped like `list_agents`.
+    pub(crate) async fn inspect_directly_owned_native_children(
+        &self,
+        parent_thread_id: ThreadId,
+    ) -> Result<Vec<OwnedChildInspection>, OwnedChildrenReadError> {
+        let manager = self
+            .upgrade()
+            .map_err(|_| OwnedChildrenReadError::SessionUnavailable)?;
+        let children = self
+            .open_thread_spawn_children(parent_thread_id)
+            .await
+            .map_err(|err| OwnedChildrenReadError::InspectionFailed {
+                thread_id: parent_thread_id,
+                reason: err.to_string(),
+            })?;
+        let child_ids = children
+            .into_iter()
+            .map(|(child_thread_id, _)| child_thread_id)
+            .collect::<Vec<_>>();
+        self.inspect_owned_child_ids(&manager, &child_ids).await
+    }
+
+    /// Inspects explicit child identities, propagating the first failure.
+    ///
+    /// Production lists ids via
+    /// [`Self::inspect_directly_owned_native_children`]; tests pass explicit
+    /// ids (including unknown ones) to prove failed lookups propagate instead
+    /// of being skipped.
+    pub(crate) async fn inspect_owned_child_ids(
+        &self,
+        manager: &Arc<ThreadManagerState>,
+        child_ids: &[ThreadId],
+    ) -> Result<Vec<OwnedChildInspection>, OwnedChildrenReadError> {
+        let mut inspections = Vec::with_capacity(child_ids.len());
+        for child_thread_id in child_ids {
+            let child_thread_id = *child_thread_id;
+            match manager.get_thread(child_thread_id).await {
+                Ok(thread) => {
+                    inspections.push(OwnedChildInspection::Loaded {
+                        thread_id: child_thread_id,
+                        status: thread.agent_status().await,
+                    });
+                }
+                Err(err) if matches!(err.details(), CodexErrorDetails::ThreadNotFound(_)) => {
+                    self.ensure_agent_known(child_thread_id).map_err(|_| {
+                        OwnedChildrenReadError::UnknownChild {
+                            thread_id: child_thread_id,
+                        }
+                    })?;
+                    inspections.push(OwnedChildInspection::Unloaded {
+                        thread_id: child_thread_id,
+                    });
+                }
+                Err(err) => {
+                    return Err(OwnedChildrenReadError::InspectionFailed {
+                        thread_id: child_thread_id,
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(inspections)
     }
 }
