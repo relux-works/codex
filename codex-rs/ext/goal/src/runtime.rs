@@ -719,20 +719,8 @@ impl GoalRuntimeHandle {
                     gate.signal_arrived();
                     gate.wait_release().await;
                 }
-                // Insert BEFORE checking pending mail, then recheck via the
-                // existing scheduler; this closes completion-before-registration.
-                crate::native_wait::try_register_goal_wait_sleep(
-                    thread.thread_extension_data(),
-                    self.inner.background_wait.generation(),
-                );
-                // The recheck can synchronously start a wake turn, whose
-                // `on_turn_start` needs this same goal-state permit: share
-                // ownership with that callback rather than letting it
-                // reacquire the semaphore this task holds (self-deadlock).
-                // The lease removes the entry when the block ends without a
-                // turn consuming it, so no stale permit outlives this
-                // critical section; the goal-continuation insert below
-                // installs a fresh entry for its own start attempt.
+                // Mutant: recheck BEFORE the insert, with no post-insert
+                // recheck, so already-pending mail never wakes (latch lost).
                 {
                     thread
                         .thread_extension_data()
@@ -740,6 +728,10 @@ impl GoalRuntimeHandle {
                     let _recheck_start_lease = GoalTurnStartLease(thread.thread_extension_data());
                     thread.recheck_pending_work_for_goal_wait().await;
                 }
+                crate::native_wait::try_register_goal_wait_sleep(
+                    thread.thread_extension_data(),
+                    self.inner.background_wait.generation(),
+                );
             } else {
                 crate::native_wait::remove_goal_wait_sleep(thread.thread_extension_data());
             }
